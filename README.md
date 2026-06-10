@@ -9,7 +9,7 @@ No manual two-step pipeline. No GPU. No API keys.
 ## Install
 
 ```bash
-git clone https://github.com/Arnav-M/novelflow.git
+git clone https://github.com/Arnav-M/Novelflow.git
 cd novelflow
 pip install -e .
 ```
@@ -20,7 +20,7 @@ Requires Python 3.10+.
 
 ## Install (end users)
 
-Download **`Novelflow-Setup.exe`** from [GitHub Releases](https://github.com/Arnav-M/novelflow/releases) and run the wizard. No Python or PowerShell required.
+Download **`Novelflow-Setup.exe`** from [GitHub Releases](https://github.com/Arnav-M/Novelflow/releases) and run the wizard. No Python or PowerShell required.
 
 Creates a Start menu shortcut and optional desktop icon. Uninstall via Windows Settings → Apps.
 
