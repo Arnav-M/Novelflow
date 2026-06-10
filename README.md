@@ -91,7 +91,7 @@ PDF  →  PyMuPDF (extract)  →  novelflow refine  →  .readable.md
 
 ## Why PyMuPDF?
 
-Novelflow targets **fiction novels**, not scanned academic papers. On a real HarperCollins thriller (~600k chars):
+Novelflow targets **Books and novels**, not scanned academic papers. On a real HarperCollins thriller (~600k chars):
 
 | Extractor | Time | NUL bytes | Dropped letters | Italic hints |
 |-----------|------|-----------|-----------------|--------------|
@@ -99,8 +99,6 @@ Novelflow targets **fiction novels**, not scanned academic papers. On a real Har
 | pypdfium2 | 1.1s | 0 | Yes (`toana`) | — |
 | pymupdf4llm | 65s | 0 | Partial | Markdown headers |
 | markitdown | 80s | 1,541 | NUL placeholders | 0 (pdfminer) |
-
-Heavier tools ([Marker](https://github.com/VikParuchuri/marker), [MinerU](https://github.com/opendatalab/MinerU), [Docling](https://github.com/docling-project/docling)) excel on complex layouts and tables but need PyTorch/GPU and are overkill for prose fiction.
 
 ## License
 
