@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "novelflow"
+version = "0.1.0"
+description = "Convert PDF novels to readable markdown in one command."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["pdf", "markdown", "markitdown", "ebook", "fiction"]
+authors = [{ name = "Novelflow" }]
+dependencies = [
+    "markitdown[pdf]>=0.1.0",
+]
+
+[project.scripts]
+novelflow = "novelflow.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/novelflow"]
