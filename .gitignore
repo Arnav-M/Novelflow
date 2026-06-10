@@ -1,0 +1,27 @@
+﻿__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# PyInstaller / Inno Setup
+build/
+dist/
+installer/output/
+*.exe
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# Local test outputs
+*.pdf
+*.readable.md
+*.raw.md
+benchmark_results.json
+bench_*
+.pytest_cache/
