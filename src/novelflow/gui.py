@@ -80,7 +80,7 @@ class NovelflowApp(tk.Tk):
         )
         self.hero_canvas.create_rectangle(0, 102, 2000, 108, fill=self.colors["accent"], tags="accent_bar", width=0)
         self.hero_canvas.update_idletasks()
-        draw_hero_gradient(self.hero_canvas, self.hero_canvas.winfo_width(), self.hero_canvas.winfo_height(), self.colors)
+        self.after_idle(self._redraw_hero)
 
         content = ttk.Frame(outer, padding=20)
         content.pack(fill=tk.BOTH, expand=True)

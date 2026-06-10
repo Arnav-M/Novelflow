@@ -107,10 +107,11 @@ def draw_hero_gradient(canvas: tk.Canvas, width: int, height: int, colors: dict[
         y0 = int(band * band_h)
         y1 = int((band + 1) * band_h) if band < bands - 1 else height
         ratio = (y0 + y1) / max(2 * height, 1)
-        r = int(top[0] + (bottom[0] - top[0]) * ratio)
-        g = int(top[1] + (bottom[1] - top[1]) * ratio)
-        b = int(top[2] + (bottom[2] - top[2]) * ratio)
-        fill = f"#{r:02x}{g:02x}{b:02x}"
+        fill = _rgb_to_hex(
+            _lerp_channel(top[0], bottom[0], ratio),
+            _lerp_channel(top[1], bottom[1], ratio),
+            _lerp_channel(top[2], bottom[2], ratio),
+        )
         canvas.create_rectangle(0, y0, width, y1, fill=fill, outline=fill, tags="grad")
 
     canvas.tag_lower("grad")
@@ -126,6 +127,15 @@ def pulse_accent_bar(canvas: tk.Canvas, colors: dict[str, str], *, step: int = 0
 def _hex_to_rgb(value: str) -> tuple[int, int, int]:
     value = value.lstrip("#")
     return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _lerp_channel(start: int, end: int, ratio: float) -> int:
+    ratio = min(1.0, max(0.0, ratio))
+    return min(255, max(0, int(start + (end - start) * ratio)))
+
+
+def _rgb_to_hex(r: int, g: int, b: int) -> str:
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def make_accent_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> tk.Button:
