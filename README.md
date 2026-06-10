@@ -2,7 +2,7 @@
 
 **PDF → readable markdown in one command.**
 
-Novelflow wraps [Microsoft markitdown](https://github.com/microsoft/markitdown) and post-processes the output so fiction PDFs become actually readable: proper paragraphs, foldable chapter headings, scene headers, navigation links, and common OCR fixes.
+Novelflow wraps [Microsoft markitdown](https://github.com/microsoft/markitdown) and post-processes the output so book PDFs become actually readable: proper paragraphs, foldable chapter headings, scene headers, navigation links, and common OCR fixes.
 
 No manual two-step pipeline. No GPU. No API keys.
 
