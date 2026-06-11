@@ -19,9 +19,11 @@ desktop.ini
 .vscode/
 
 # Local test outputs
-*.pdf
 *.readable.md
 *.raw.md
+*.audiobook.*
+*.manifest.json
+*.chapters.json
+*_audiobook_work/
 benchmark_results.json
-bench_*
-.pytest_cache/
+tests/fixtures/pdfs/*.pdf

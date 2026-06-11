@@ -19,6 +19,15 @@ hiddenimports = [
     "novelflow.pdf_italics",
     "novelflow.text_cleanup",
     "novelflow.gui_theme",
+    "novelflow.audiobook",
+    "novelflow.book_structure",
+    "novelflow.tts_engines",
+    "novelflow.tts_voices",
+    "novelflow.tts_config",
+    "novelflow.tts_text",
+    "novelflow.audio_merge",
+    "novelflow.user_paths",
+    "edge_tts",
 ]
 
 for pkg in ("pymupdf",):

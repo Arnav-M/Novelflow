@@ -1,104 +1,104 @@
 ﻿# Novelflow
 
-**PDF → readable markdown in one command.**
+**PDF → readable markdown → chapter-marked audiobook.**
 
 Novelflow extracts text with [PyMuPDF](https://pymupdf.readthedocs.io/) and post-processes it so fiction PDFs become actually readable: proper paragraphs, foldable chapter headings, scene headers, navigation links, and common glyph fixes.
 
-No manual two-step pipeline. No GPU. No API keys.
+Optionally builds a **local audiobook** (M4B/MP3) with navigable section markers — title, dedication, chapters, acknowledgements, and more.
 
-## Install
-
-```bash
-git clone https://github.com/Arnav-M/Novelflow.git
-cd novelflow
-pip install -e .
-```
-
-Re-run `pip install -e .` whenever you **move** this folder — otherwise `novelflow-gui` will break.
-
-Requires Python 3.10+.
+No manual pipeline. No upload. No page limits.
 
 ## Install (end users)
 
-Download **`Novelflow-Setup.exe`** from [GitHub Releases](https://github.com/Arnav-M/Novelflow/releases) and run the wizard. No Python or PowerShell required.
+Download **`Novelflow-Setup.exe`** from [GitHub Releases](https://github.com/Arnav-M/Novelflow/releases) and run the wizard. No Python required.
 
-Creates a Start menu shortcut and optional desktop icon. Uninstall via Windows Settings → Apps.
+For audiobooks, install [ffmpeg](https://ffmpeg.org/) and add it to your PATH.
 
-## Build the installer (maintainers)
+## Install (developers)
 
-Double-click **`build_installer.bat`** (or run from cmd). One-time prerequisites:
+```bash
+git clone https://github.com/Arnav-M/Novelflow.git
+cd Novelflow
+pip install -e ".[audiobook,dev]"
+```
 
-1. [Python 3.10+](https://python.org)
-2. [Inno Setup 6](https://jrsoftware.org/isdl.php) (free) — only needed to create the setup wizard
-
-Output: `installer\output\Novelflow-Setup.exe` — upload that to GitHub Releases.
-
-## GUI (developers)
-
-After `pip install -e .`: run `novelflow-gui` or `python -m novelflow.gui`.
-
-Dark-themed desktop UI with gradient header, progress bar, and success pulse. Pick a PDF, optional output path, click **Convert**. Shortcuts: `Ctrl+Enter` = convert, `Ctrl+L` = clear log.
+Requires Python 3.10+.
 
 ## Usage (CLI)
 
 ```bash
-novelflow "path/to/book.pdf"
+# Markdown only
+novelflow "book.pdf"
+
+# Markdown + audiobook (auto engine — Kokoro on GPU, else parallel Edge)
+novelflow "book.pdf" --audiobook
+
+# Include dedication, acknowledgements, etc.
+novelflow "book.pdf" --audiobook --all-sections
+
+# Audiobook from existing markdown
+novelflow book.readable.md --from-markdown --audiobook
+
+# List voices
+novelflow --list-voices --tts-engine edge
+novelflow --list-voices --tts-engine kokoro
 ```
 
-Output: `book.readable.md` in the same folder.
+Output:
+- `book.readable.md` — cleaned markdown
+- `book.audiobook.m4b` — audiobook with chapter markers
+- `book.audiobook.manifest.json` — section timestamps for in-app skip (future UI)
+
+## Audiobook sections
+
+By default only **title + chapters** are synthesized (skips Contents, Dedication, Acknowledgements, etc.).
+
+Use the **Audiobook settings** tab in the GUI to enable extra sections, or:
 
 ```bash
-novelflow book.pdf -o book.md
-novelflow book.pdf --keep-raw   # also saves book.raw.md (extracted text before cleanup)
+novelflow book.pdf --audiobook --all-sections
 ```
 
-Or as a module:
+Section markers are saved in `.manifest.json` with `start_ms` / `end_ms` for in-app skip.
+
+## TTS engines
+
+| Engine | When used | Speed |
+|--------|-----------|--------|
+| **auto** (default) | Kokoro if GPU/DirectML detected, else Edge | Best for your PC |
+| **edge** | Online, 6 parallel chunks × 4 parallel sections | ~2–4× faster than before |
+| **kokoro** | Offline; WAV batched, one MP3 encode per section | Fastest with NVIDIA/DirectML GPU |
+
+## GUI
+
+Run `novelflow-gui` — check **Also create chapter-marked audiobook** on the Convert tab, then open **Audiobook settings** for engine, voice, and section pickers.
+
+## Test sample PDFs
+
+Local fiction PDFs live in `tests/fixtures/pdfs/`:
+
+- `the-mozart-conspiracy.pdf` — long thriller (~70 chapters)
+- `doomsday-prophecy.pdf` — long thriller with dedication, contents, acknowledgements
+
+Run tests (regenerates `.readable.md` outputs):
 
 ```bash
-python -m novelflow book.pdf
+python -m pytest tests/test_integration_pdfs.py -v
 ```
 
-## Python API
+Optional Gutenberg downloads (if you want more samples):
 
-```python
-from novelflow import convert_pdf
-
-convert_pdf("book.pdf")
-convert_pdf("book.pdf", output_path="book.md", keep_raw=True)
+```bash
+python scripts/download_sample_pdfs.py
 ```
-
-## What it fixes
-
-| Problem (raw PDF text) | After novelflow |
-|--------------------------|-----------------|
-| One line per PDF row | Full paragraphs with `\n\n` spacing |
-| Page breaks mid-sentence | Merged across breaks |
-| `crystal-\nclear` | `crystal-clear` |
-| Plain `Chapter One` | `## Chapter One` (foldable in VS Code/Obsidian) |
-| Location/time lines merged into prose | Italic scene headers |
-| Italic PDF fonts lost in plain extract | PyMuPDF font scan + italic hints |
-| Pipe-table garbage (`\| word \| word \|`) | Flattened back to prose |
-| Merged headers (`June 2008The first day`) | Split into separate lines |
-| TOC vs story chapters confused | Auto-detected |
-| `ZoA"` encoding glitches | Generic accent repair |
-| Missing `f` ligatures (`toʃana`, NUL bytes) | Normalized to `tofana` |
 
 ## Pipeline
 
 ```
-PDF  →  PyMuPDF (extract)  →  novelflow refine  →  .readable.md
+PDF  →  PyMuPDF  →  novelflow refine  →  .readable.md  →  TTS  →  .audiobook.m4b
+                                              ↓
+                                    .manifest.json (section markers)
 ```
-
-## Why PyMuPDF?
-
-Novelflow targets **Books and novels**, not scanned academic papers. On a real HarperCollins thriller (~600k chars):
-
-| Extractor | Time | NUL bytes | Dropped letters | Italic hints |
-|-----------|------|-----------|-----------------|--------------|
-| **PyMuPDF** | **0.4s** | **0** | **No** | **217 lines** |
-| pypdfium2 | 1.1s | 0 | Yes (`toana`) | — |
-| pymupdf4llm | 65s | 0 | Partial | Markdown headers |
-| markitdown | 80s | 1,541 | NUL placeholders | 0 (pdfminer) |
 
 ## License
 

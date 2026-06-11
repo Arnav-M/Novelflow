@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "novelflow"
-version = "0.1.0"
-description = "Convert PDF novels to readable markdown in one command."
+version = "0.2.0"
+description = "Convert PDF novels to readable markdown and chapter-marked audiobooks."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-keywords = ["pdf", "markdown", "pymupdf", "ebook", "fiction"]
+keywords = ["pdf", "markdown", "pymupdf", "ebook", "fiction", "audiobook", "tts"]
 authors = [{ name = "Novelflow" }]
 dependencies = [
     "pymupdf>=1.24.0",
@@ -19,13 +19,20 @@ dependencies = [
 novelflow = "novelflow.cli:main"
 novelflow-gui = "novelflow.gui:main"
 
+[project.optional-dependencies]
+audiobook = [
+    "edge-tts>=6.1.0",
+]
+gui = [
+    "pygame>=2.5",
+    "tkinterdnd2>=0.4",
+]
+build = ["pyinstaller>=6.0"]
+dev = ["pytest>=8.0"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/novelflow"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/novelflow/assets/icon.ico" = "novelflow/assets/icon.ico"
 "src/novelflow/assets/icon.png" = "novelflow/assets/icon.png"
-
-[project.optional-dependencies]
-build = ["pyinstaller>=6.0"]
-dev = ["pytest>=8.0"]

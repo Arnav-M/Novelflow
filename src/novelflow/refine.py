@@ -363,7 +363,7 @@ def refine_markdown(text: str, *, italic_hints: set[str] | None = None) -> str:
 
         if is_heading(stripped, in_front_matter):
             flush()
-            paragraphs.append(stripped)
+            paragraphs.append(f"## {stripped}")
             scene_slots = 0
             continue
 
@@ -385,4 +385,11 @@ def refine_markdown(text: str, *, italic_hints: set[str] | None = None) -> str:
     if story_chapters and story_start_idx is not None:
         paragraphs.insert(story_start_idx, build_navigation_toc(story_chapters))
 
-    return "\n\n".join(paragraphs) + "\n"
+    output = paragraphs
+    if title:
+        header = [f"# {title}"]
+        if author:
+            header.append(f"*{author}*")
+        output = header + output
+
+    return "\n\n".join(output) + "\n"
