@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from novelflow.cover_art import find_cover_in_markdown as find_cover_image_path
 from novelflow.refine import BACK_MATTER, CHAPTER_RE, GENERIC_HEADING_RE, chapter_slug
 
 SKIP_SECTIONS = frozenset({"navigation"})

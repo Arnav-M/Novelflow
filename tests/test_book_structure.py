@@ -1,6 +1,8 @@
 """Tests for audiobook section parsing."""
 
-from novelflow.book_structure import SectionKind, parse_book_sections
+from pathlib import Path
+
+from novelflow.book_structure import SectionKind, find_cover_image_path, parse_book_sections
 
 
 SAMPLE = """\
@@ -87,6 +89,38 @@ Story here.
     titles = [s.title for s in manifest.sections]
     assert "Navigation" not in titles
     assert "Chapter One" in titles
+
+
+def test_find_cover_image_from_title_page_markdown(tmp_path: Path):
+    cover = tmp_path / "cover-art.png"
+    cover.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    md = tmp_path / "book.readable.md"
+    md.write_text(
+        "# The Example Novel\n\n"
+        "![Cover](cover-art.png)\n\n"
+        "## Chapter One\n\n"
+        "Story.\n",
+        encoding="utf-8",
+    )
+    assert find_cover_image_path(md) == cover.resolve()
+
+
+def test_find_cover_image_from_colocated_export(tmp_path: Path):
+    md = tmp_path / "novel.readable.md"
+    md.write_text("# Novel\n\n## Chapter One\n\nHi.\n", encoding="utf-8")
+    cover = tmp_path / "novel.readable.cover.png"
+    cover.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    assert find_cover_image_path(md) == cover.resolve()
 
 
 def test_duplicate_titles_collapsed():

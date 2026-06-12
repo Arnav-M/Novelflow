@@ -58,6 +58,68 @@ def space(units: float, scale: float = 1.0) -> int:
     return max(1, int(round(px * scale)))
 
 
+CONFIGURE_DEBOUNCE_MS = 16
+
+
+def schedule_debounced_configure(
+    widget: tk.Misc,
+    callback,
+    *,
+    ms: int = CONFIGURE_DEBOUNCE_MS,
+    after_attr: str = "_debounce_configure_after",
+) -> None:
+    """Run ``callback`` once, ``ms`` after the last configure in a burst."""
+    after_id = getattr(widget, after_attr, None)
+    if after_id is not None:
+        try:
+            widget.after_cancel(after_id)
+        except tk.TclError:
+            pass
+
+    def fire() -> None:
+        setattr(widget, after_attr, None)
+        try:
+            if widget.winfo_exists():
+                callback()
+        except tk.TclError:
+            pass
+
+    setattr(widget, after_attr, widget.after(ms, fire))
+
+
+def cancel_debounced_configure(
+    widget: tk.Misc, *, after_attr: str = "_debounce_configure_after",
+) -> None:
+    after_id = getattr(widget, after_attr, None)
+    if after_id is not None:
+        try:
+            widget.after_cancel(after_id)
+        except tk.TclError:
+            pass
+        setattr(widget, after_attr, None)
+
+
+def bind_debounced_configure(
+    widget: tk.Misc,
+    callback,
+    *,
+    ms: int = CONFIGURE_DEBOUNCE_MS,
+    filter_same_size: bool = True,
+) -> None:
+    """Bind ``callback`` to ``<Configure>``, coalesced to one call per burst."""
+    size_attr = "_debounce_last_configure_size"
+
+    def on_configure(event) -> None:
+        if filter_same_size:
+            size = (event.width, event.height)
+            if size == getattr(widget, size_attr, None):
+                return
+            setattr(widget, size_attr, size)
+        schedule_debounced_configure(widget, callback, ms=ms)
+
+    widget.bind("<Configure>", on_configure)
+
+
 def configure_gutter_grid(
     frame,
     *,
@@ -194,9 +256,9 @@ def refresh_font_registry(colors: dict[str, str], scale: float) -> None:
             pass
 
 
-def _palette() -> dict[str, str]:
-    """Layered dark surfaces — bg < surface < card, subtle border."""
-    return {
+_THEMES: dict[str, dict[str, str]] = {
+    # Layered dark surfaces — bg < surface < card, subtle border.
+    "dark": {
         "bg": "#12121a",
         "surface": "#1a1a24",
         "card": "#222230",
@@ -228,11 +290,33 @@ def _palette() -> dict[str, str]:
         "success": "#6d5ce8",
         "ok": "#3fb27f",
         "danger": "#e5484d",
-    }
+        "on_accent": "#ffffff",
+        "glow_alt": "#c084fc",
+        "footer_bg": "#0a0a0f",
+        "footer_purple_dark": "#2a1f4a",
+        "footer_danger_bg": "#1a0a10",
+        "footer_danger": "#b83248",
+        "footer_danger_dark": "#5a1830",
+        "toast_shadow": "#050508",
+        "timeline_played": "#4a42a0",
+        "timeline_track": "#3a3f5a",
+    },
+}
+
+DEFAULT_THEME = "dark"
 
 
-def apply_theme(root: tk.Tk, *, scale: float = 1.0) -> dict[str, str]:
-    colors = _palette()
+def available_themes() -> tuple[str, ...]:
+    return tuple(_THEMES)
+
+
+def _palette(theme: str = DEFAULT_THEME) -> dict[str, str]:
+    return dict(_THEMES.get(theme, _THEMES[DEFAULT_THEME]))
+
+
+def apply_theme(root: tk.Tk, *, scale: float = 1.0, theme: str = DEFAULT_THEME) -> dict[str, str]:
+    colors = _palette(theme)
+    colors["_theme"] = theme if theme in _THEMES else DEFAULT_THEME
     colors["_font_registry"] = []
 
     root.configure(bg=colors["bg"])
@@ -261,11 +345,25 @@ def refresh_theme_scale(root: tk.Tk, colors: dict[str, str], scale: float) -> di
     colors["_style"] = style
     _apply_style_fonts(style, colors, scale)
     _configure_combobox_style(style, colors, scale)
+    _configure_scrollbar_style(style, colors)
     refresh_font_registry(colors, scale)
-    log_widget = colors.get("_log_widget")
-    if log_widget is not None:
+    refresh_canvas_buttons(colors, scale)
+    for log_widget in colors.get("_log_widgets", []):
         configure_log_widget(log_widget, colors)
     return colors
+
+
+def refresh_canvas_buttons(colors: dict[str, str], scale: float) -> None:
+    """Rescale and repaint every live CanvasButton; prune destroyed ones."""
+    alive = []
+    for btn in colors.get("_canvas_buttons", []):
+        try:
+            if btn.winfo_exists():
+                btn.rescale(scale)
+                alive.append(btn)
+        except tk.TclError:
+            pass
+    colors["_canvas_buttons"] = alive
 
 
 def _apply_style_fonts(style: ttk.Style, colors: dict[str, str], scale: float) -> None:
@@ -319,7 +417,7 @@ def _apply_style_fonts(style: ttk.Style, colors: dict[str, str], scale: float) -
     )
     style.configure(
         "CardSectionHeading.TLabel",
-        background=colors["bg"],
+        background=colors["card"],
         foreground=colors["hero_title"],
         font=typeface("display", s, weight="bold"),
     )
@@ -470,7 +568,7 @@ def _configure_combobox_style(style: ttk.Style, colors: dict[str, str], scale: f
         "lightcolor": colors["border"],
         "darkcolor": colors["border"],
         "selectbackground": colors["accent"],
-        "selectforeground": "#ffffff",
+        "selectforeground": colors.get("on_accent", "#ffffff"),
         "padding": (space(4, scale), space(3, scale)),
         "font": typeface("body", scale),
     }
@@ -507,7 +605,7 @@ def _apply_global_widget_colors(root: tk.Misc, colors: dict[str, str]) -> None:
         "*Listbox.Background": colors["surface"],
         "*Listbox.Foreground": colors["text"],
         "*Listbox.selectBackground": colors["accent"],
-        "*Listbox.selectForeground": "#ffffff",
+        "*Listbox.selectForeground": colors.get("on_accent", "#ffffff"),
         "*Scrollbar.Background": colors["browse_bg"],
         "*Scrollbar.TroughColor": colors["bg"],
         "*Scrollbar.ActiveBackground": colors["browse_hover"],
@@ -532,7 +630,7 @@ def configure_dark_combobox(combo: ttk.Combobox, colors: dict[str, str]) -> None
                 background=surface,
                 foreground=text,
                 selectbackground=accent,
-                selectforeground="#ffffff",
+                selectforeground=colors.get("on_accent", "#ffffff"),
                 highlightthickness=0,
                 activestyle="none",
                 font=typeface("body", scale),
@@ -555,6 +653,96 @@ def configure_dark_combobox(combo: ttk.Combobox, colors: dict[str, str]) -> None
 
     combo.bind("<Button-1>", lambda _e: combo.after(1, style_popup), add="+")
     combo.bind("<Down>", lambda _e: combo.after(1, style_popup), add="+")
+
+
+def position_floating_tooltip(
+    tip: tk.Toplevel,
+    anchor: tk.Misc,
+    x_root: int,
+    y_root: int,
+    *,
+    offset_x: int = 12,
+    offset_y: int = 18,
+    prefer_above: bool = False,
+) -> None:
+    """Place a borderless tooltip on the same monitor as the anchor window."""
+    tip.update_idletasks()
+    try:
+        tw = tip.winfo_reqwidth()
+        th = tip.winfo_reqheight()
+        root = anchor.winfo_toplevel()
+        rx = root.winfo_rootx()
+        ry = root.winfo_rooty()
+        rw = max(root.winfo_width(), 1)
+        rh = max(root.winfo_height(), 1)
+
+        x = x_root + offset_x
+        y = y_root - th - abs(offset_y) if prefer_above else y_root + offset_y
+
+        if x + tw > rx + rw - 8:
+            x = x_root - tw - offset_x
+        if y + th > ry + rh - 8:
+            y = y_root - th - abs(offset_y)
+        if y < ry + 8:
+            y = y_root + abs(offset_y)
+
+        x = max(rx + 8, min(x, rx + rw - tw - 8))
+        y = max(ry + 8, min(y, ry + rh - th - 8))
+        tip.geometry(f"+{x}+{y}")
+    except tk.TclError:
+        tip.geometry(f"+{x_root + offset_x}+{y_root + offset_y}")
+
+
+def attach_tooltip(widget: tk.Misc, text: str, colors: dict[str, str], *, delay_ms: int = 450) -> None:
+    """Floating dark chip tooltip near the cursor on hover."""
+    state: dict[str, object] = {"after": None, "tip": None}
+
+    def hide(_event=None) -> None:
+        after_id = state["after"]
+        if after_id is not None:
+            try:
+                widget.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            state["after"] = None
+        tip = state["tip"]
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+            state["tip"] = None
+
+    def show(event) -> None:
+        hide()
+        try:
+            scale = float(colors.get("_scale", "1"))
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            try:
+                tip.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            tip.configure(bg=colors["border"])
+            inner = tk.Frame(tip, bg=colors["surface"], padx=space(2, scale), pady=space(1, scale))
+            inner.pack(padx=1, pady=1)
+            tk.Label(
+                inner, text=text, bg=colors["surface"], fg=colors["text"],
+                font=typeface("caption", scale),
+            ).pack()
+            position_floating_tooltip(tip, widget, event.x_root, event.y_root)
+            state["tip"] = tip
+        except tk.TclError:
+            pass
+
+    def schedule(event) -> None:
+        hide()
+        state["after"] = widget.after(delay_ms, lambda e=event: show(e))
+
+    widget.bind("<Enter>", schedule, add="+")
+    widget.bind("<Leave>", hide, add="+")
+    widget.bind("<Button>", hide, add="+")
+    widget.bind("<Destroy>", hide, add="+")
 
 
 def corner_radius(scale: float = 1.0) -> int:
@@ -704,22 +892,35 @@ def _make_round_surface(
         state["w"], state["h"] = w, h
         _paint_round_card(canvas, win, inner, width=w, height=h, radius=r, page_bg=page_bg, card_fill=fill, border=border)
 
-    def _on_canvas_configure(event) -> None:
-        if event.width <= 1 or event.height <= 1:
-            return
-        locked = getattr(outer, "_fixed_height", None)
-        h = locked if locked is not None else max(event.height, 1)
-        _paint(max(event.width, 1), h)
+    def _on_canvas_configure(_event=None) -> None:
+        def repaint() -> None:
+            if not canvas.winfo_exists():
+                return
+            locked = getattr(outer, "_fixed_height", None)
+            w = max(canvas.winfo_width(), 1)
+            h = locked if locked is not None else max(canvas.winfo_height(), 1)
+            if w <= 1 or h <= 1:
+                return
+            _paint(w, h)
+
+        schedule_debounced_configure(canvas, repaint)
 
     def _on_inner_configure(_event=None) -> None:
         if getattr(outer, "_fixed_height", None) is not None:
             return
-        inner.update_idletasks()
-        min_h = inner.winfo_reqheight() + 2 * (r + 1)
-        cur_h = max(canvas.winfo_height(), 1)
-        if min_h > cur_h:
-            canvas.configure(height=min_h)
-            _paint(max(canvas.winfo_width(), 1), min_h)
+
+        def resize_to_content() -> None:
+            if not canvas.winfo_exists():
+                return
+            inner.update_idletasks()
+            min_h = inner.winfo_reqheight() + 2 * (r + 1)
+            cur_h = max(canvas.winfo_height(), 1)
+            if min_h > cur_h:
+                canvas.configure(height=min_h)
+                w = max(canvas.winfo_width(), 1)
+                _paint(w, min_h)
+
+        schedule_debounced_configure(inner, resize_to_content)
 
     canvas.bind("<Configure>", _on_canvas_configure)
     if fixed_height is None:
@@ -801,6 +1002,10 @@ class CanvasButton(tk.Frame):
         self._scale = float(colors.get("_scale", "1"))
         self._pad_x = pad_x if pad_x is not None else space(4, self._scale)
         self._pad_y = pad_y if pad_y is not None else space(2, self._scale)
+        # Unscaled padding so the button can re-derive its size when the UI
+        # scale changes (see rescale / refresh_theme_scale).
+        self._pad_x_base = self._pad_x / max(self._scale, 0.01)
+        self._pad_y_base = self._pad_y / max(self._scale, 0.01)
         self._state = tk.NORMAL
         self._hover = False
         self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, cursor="hand2")
@@ -808,7 +1013,15 @@ class CanvasButton(tk.Frame):
         self._canvas.bind("<Button-1>", self._on_click)
         self._canvas.bind("<Enter>", self._on_enter)
         self._canvas.bind("<Leave>", self._on_leave)
+        colors.setdefault("_canvas_buttons", []).append(self)
         self.after_idle(self._redraw)
+
+    def rescale(self, scale: float) -> None:
+        """Recompute size/padding for a new UI scale and redraw."""
+        self._scale = scale
+        self._pad_x = max(1, int(round(self._pad_x_base * scale)))
+        self._pad_y = max(1, int(round(self._pad_y_base * scale)))
+        self._redraw()
 
     def _font(self) -> tkfont.Font:
         weight = self._font_weight or "normal"
@@ -821,7 +1034,7 @@ class CanvasButton(tk.Frame):
             if disabled:
                 return c["border_subtle"], c["muted"], c["border_subtle"]
             bg = c["accent_hover"] if self._hover else c["accent"]
-            return bg, "#ffffff", bg
+            return bg, c.get("on_accent", "#ffffff"), bg
         if self._variant == "browse":
             if disabled:
                 return c["surface"], c["muted"], c["border"]
@@ -1007,7 +1220,9 @@ def configure_log_widget(widget: tk.Text, colors: dict[str, str]) -> None:
             )
         except tk.TclError:
             pass
-    colors["_log_widget"] = widget
+    log_widgets = colors.setdefault("_log_widgets", [])
+    if widget not in log_widgets:
+        log_widgets.append(widget)
 
 
 def set_window_icon(root: tk.Tk) -> None:

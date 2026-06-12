@@ -104,11 +104,15 @@ def scan_audiobook_folder(folder: Path) -> list[tuple[str, Path]]:
     )
 
 
-def load_chapters(audio_path: Path) -> list[Chapter]:
+def load_chapters(audio_path: Path, *, probe_durations: bool = True) -> list[Chapter]:
     """Build a playable chapter list for an audiobook or standalone audio file.
 
     Accepts a final audio file, a ``*.chapters.json`` sidecar, or a missing
     audio path whose sidecar still points at section MP3s on disk.
+
+    ``probe_durations=False`` skips the (blocking) ffprobe fallback for
+    standalone tracks; callers can fill in ``duration_ms`` asynchronously via
+    :func:`probe_chapter_durations`.
     """
     audio_path = Path(audio_path)
     if audio_path.name.endswith(".chapters.json"):
@@ -125,12 +129,28 @@ def load_chapters(audio_path: Path) -> list[Chapter]:
         return [
             Chapter(
                 title=audio_path.stem,
-                duration_ms=_probe_duration_ms(audio_path),
+                duration_ms=_probe_duration_ms(audio_path) if probe_durations else 0,
                 file=audio_path,
                 start_ms=0,
             )
         ]
     return []
+
+
+def probe_chapter_durations(chapters: list[Chapter]) -> bool:
+    """Fill in missing ``duration_ms`` values via ffprobe. Returns True if any changed.
+
+    Safe to call from a worker thread — it only mutates the plain dataclass
+    fields, never touches the mixer or any UI.
+    """
+    changed = False
+    for chapter in chapters:
+        if chapter.duration_ms <= 0 and chapter.file is not None:
+            duration = _probe_duration_ms(chapter.file)
+            if duration > 0:
+                chapter.duration_ms = duration
+                changed = True
+    return changed
 
 
 def is_pygame_playable(path: Path) -> bool:
@@ -161,6 +181,34 @@ def cached_speed_variant(source: Path, speed: float) -> Path | None:
         return Path(source)
     out = _speed_variant_path(source, speed)
     return out if out.is_file() and out.stat().st_size > 1024 else None
+
+
+def prune_speed_cache(*, max_age_days: float = 14.0, max_total_mb: float = 512.0) -> None:
+    """Trim the speed-variant temp cache (old files first, then size cap)."""
+    import time
+
+    try:
+        entries = []
+        cutoff = time.time() - max_age_days * 86400
+        for path in _speed_cache_dir().glob("*.mp3"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+            else:
+                entries.append((stat.st_mtime, stat.st_size, path))
+        entries.sort()  # oldest first
+        total = sum(size for _mtime, size, _path in entries)
+        budget = int(max_total_mb * 1024 * 1024)
+        for _mtime, size, path in entries:
+            if total <= budget:
+                break
+            path.unlink(missing_ok=True)
+            total -= size
+    except OSError:
+        pass
 
 
 def make_speed_variant(source: Path, speed: float) -> Path | None:
@@ -206,6 +254,7 @@ class AudioPlayer:
         self.chapters: list[Chapter] = []
         self.index = 0
         self._offset_ms = 0  # seek base within the current chapter
+        self._last_pos_ms = 0  # last observed position (survives mixer stop)
         self._playing = False
         self._loaded_file: Path | None = None
         self.speed = 1.0
@@ -228,9 +277,9 @@ class AudioPlayer:
         except ImportError:
             return False
 
-    def load(self, audio_path: Path) -> list[Chapter]:
+    def load(self, audio_path: Path, *, probe_durations: bool = True) -> list[Chapter]:
         self.stop()
-        self.chapters = load_chapters(audio_path)
+        self.chapters = load_chapters(audio_path, probe_durations=probe_durations)
         self.index = 0
         self._offset_ms = 0
         self._loaded_file = None
@@ -253,6 +302,7 @@ class AudioPlayer:
             return False
         self.index = index
         self._offset_ms = max(0, start_ms)
+        self._last_pos_ms = self._offset_ms
         mixer = self._ensure_mixer()
         mixer.set_volume(self.volume)
         mixer.play(start=self._offset_ms / 1000.0)
@@ -271,6 +321,7 @@ class AudioPlayer:
         mixer = self._ensure_mixer()
         self.index = index
         self._offset_ms = max(0, start_ms)
+        self._last_pos_ms = self._offset_ms
         if self._loaded_file != path:
             mixer.load(str(path))
             self._loaded_file = path
@@ -320,6 +371,7 @@ class AudioPlayer:
         self._playing = False
         self._loaded_file = None
         self._offset_ms = 0
+        self._last_pos_ms = 0
 
     def seek_within_chapter(self, ms: int) -> None:
         self.play_chapter(self.index, start_ms=ms)
@@ -338,10 +390,14 @@ class AudioPlayer:
         """Elapsed ms within the current chapter (offset + mixer position)."""
         if self._mixer is None:
             return self._offset_ms
-        pos = self._mixer.get_pos()  # ms since play(); -1 if not started
+        pos = self._mixer.get_pos()  # ms since play(); -1 if not started/stopped
         if pos < 0:
-            return self._offset_ms
-        return self._offset_ms + pos
+            # Mixer already stopped (e.g. chapter just ended, or paused on some
+            # backends) — report the last position we actually observed so
+            # resume bookmarks don't snap back to the seek offset.
+            return self._last_pos_ms if self._last_pos_ms > 0 else self._offset_ms
+        self._last_pos_ms = self._offset_ms + pos
+        return self._last_pos_ms
 
     def is_busy(self) -> bool:
         if self._mixer is None:
