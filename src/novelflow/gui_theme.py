@@ -47,8 +47,85 @@ _SPACE = {
 }
 
 
-def space(units: int, scale: float = 1.0) -> int:
-    return max(1, int(round(_SPACE.get(units, units * 8) * scale)))
+def space(units: float, scale: float = 1.0) -> int:
+    u = float(units)
+    if u == 0.5:
+        px = _SPACE[1] / 2
+    elif u == int(u) and int(u) in _SPACE:
+        px = _SPACE[int(u)]
+    else:
+        px = u * 8
+    return max(1, int(round(px * scale)))
+
+
+def configure_gutter_grid(
+    frame,
+    *,
+    scale: float = 1.0,
+    gap_units: float = 0.5,
+) -> dict[str, int]:
+    """Five-column grid: left | gap | center (expand) | gap | right.
+
+    Gap columns reserve ``space(gap_units, scale)`` via ``minsize`` so
+    inter-column padding scales with the UI and does not rely on widget padx.
+    """
+    gap_px = space(gap_units, scale)
+    left, gap_l, center, gap_r, right = 0, 1, 2, 3, 4
+    frame.columnconfigure(left, weight=0)
+    frame.columnconfigure(gap_l, weight=0, minsize=gap_px)
+    frame.columnconfigure(center, weight=1)
+    frame.columnconfigure(gap_r, weight=0, minsize=gap_px)
+    frame.columnconfigure(right, weight=0)
+    return {
+        "left": left,
+        "gap_l": gap_l,
+        "center": center,
+        "gap_r": gap_r,
+        "right": right,
+        "gap_px": gap_px,
+    }
+
+
+def set_grid_column_gaps(
+    frame,
+    gap_units: float,
+    *,
+    scale: float = 1.0,
+    gap_columns: tuple[int, int] = (1, 3),
+) -> int:
+    """Refresh fixed-width gap columns after a UI scale change."""
+    gap_px = space(gap_units, scale)
+    for col in gap_columns:
+        frame.columnconfigure(col, weight=0, minsize=gap_px)
+    return gap_px
+
+
+def control_metrics(scale: float = 1.0) -> dict[str, int]:
+    """Shared heights and widths for form controls."""
+    return {
+        "path_ipady": space(2, scale),
+        "combobox_min_chars": 28,
+        "combobox_max_chars": 48,
+        "dropzone_min_h": space(16, scale),
+    }
+
+
+def fit_combobox(
+    combo: ttk.Combobox,
+    values: tuple[str, ...] | list[str],
+    *,
+    scale: float = 1.0,
+    min_chars: int | None = None,
+    max_chars: int | None = None,
+) -> None:
+    """Size a readonly combobox to its longest option (character width, clamped)."""
+    m = control_metrics(scale)
+    lo = min_chars if min_chars is not None else m["combobox_min_chars"]
+    hi = max_chars if max_chars is not None else m["combobox_max_chars"]
+    current = combo.get().strip()
+    candidates = list(values) + ([current] if current else [])
+    longest = max((len(str(v)) for v in candidates), default=lo)
+    combo.configure(width=max(lo, min(longest + 1, hi)))
 
 
 def enable_dpi_awareness() -> None:
@@ -229,9 +306,45 @@ def _apply_style_fonts(style: ttk.Style, colors: dict[str, str], scale: float) -
         font=typeface("title", s, weight="bold"),
     )
     style.configure(
+        "SectionHeading.TLabel",
+        background=colors["bg"],
+        foreground=colors["hero_title"],
+        font=typeface("display", s, weight="bold"),
+    )
+    style.configure(
+        "SubsectionHeading.TLabel",
+        background=colors["bg"],
+        foreground=colors["hero_kicker"],
+        font=typeface("title", s, weight="bold"),
+    )
+    style.configure(
+        "CardSectionHeading.TLabel",
+        background=colors["bg"],
+        foreground=colors["hero_title"],
+        font=typeface("display", s, weight="bold"),
+    )
+    style.configure(
+        "CardSubsectionHeading.TLabel",
+        background=colors["card"],
+        foreground=colors["hero_kicker"],
+        font=typeface("title", s, weight="bold"),
+    )
+    style.configure(
         "CardHeading.TLabel",
         background=colors["card"],
         foreground=colors["header_text"],
+        font=typeface("title", s, weight="bold"),
+    )
+    style.configure(
+        "PlayerChapterTitle.TLabel",
+        background=colors["card"],
+        foreground=colors["header_text"],
+        font=typeface("display", s, weight="bold"),
+    )
+    style.configure(
+        "PlayerFileTitle.TLabel",
+        background=colors["bg"],
+        foreground=colors["text"],
         font=typeface("title", s, weight="bold"),
     )
 
@@ -358,7 +471,7 @@ def _configure_combobox_style(style: ttk.Style, colors: dict[str, str], scale: f
         "darkcolor": colors["border"],
         "selectbackground": colors["accent"],
         "selectforeground": "#ffffff",
-        "padding": (space(3, scale), space(2, scale)),
+        "padding": (space(4, scale), space(3, scale)),
         "font": typeface("body", scale),
     }
     combo_map = {
@@ -444,42 +557,382 @@ def configure_dark_combobox(combo: ttk.Combobox, colors: dict[str, str]) -> None
     combo.bind("<Down>", lambda _e: combo.after(1, style_popup), add="+")
 
 
+def corner_radius(scale: float = 1.0) -> int:
+    return max(8, int(10 * scale))
+
+
+def draw_round_rect(
+    canvas: tk.Canvas,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    radius: int,
+    *,
+    fill: str = "",
+    outline: str = "",
+    width: int = 1,
+    tags: str = "",
+) -> None:
+    """Filled/stroked rounded rectangle on a canvas."""
+    r = min(radius, int((x2 - x1) / 2), int((y2 - y1) / 2))
+    if r <= 0:
+        canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline, width=width, tags=tags)
+        return
+    kw = {"fill": fill, "outline": outline, "width": width, "tags": tags}
+    canvas.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, style="pieslice", **kw)
+    canvas.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, style="pieslice", **kw)
+    canvas.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, style="pieslice", **kw)
+    canvas.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, style="pieslice", **kw)
+    canvas.create_rectangle(x1 + r, y1, x2 - r, y2, **kw)
+    canvas.create_rectangle(x1, y1 + r, x2, y2 - r, **kw)
+
+
+def draw_round_rect_top(
+    canvas: tk.Canvas,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    radius: int,
+    *,
+    fill: str = "",
+    outline: str = "",
+    tags: str = "",
+) -> None:
+    """Rounded top corners, square bottom — for bottom docked bars."""
+    r = min(radius, int((x2 - x1) / 2), int((y2 - y1) / 2))
+    if r <= 0:
+        canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline, tags=tags)
+        return
+    kw = {"fill": fill, "outline": outline, "tags": tags}
+    canvas.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, style="pieslice", **kw)
+    canvas.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, style="pieslice", **kw)
+    canvas.create_rectangle(x1 + r, y1, x2 - r, y1 + r, **kw)
+    canvas.create_rectangle(x1, y1 + r, x2, y2, **kw)
+
+
+def _paint_round_card(
+    canvas: tk.Canvas,
+    win: int,
+    inner: tk.Misc,
+    *,
+    width: int,
+    height: int,
+    radius: int,
+    page_bg: str,
+    card_fill: str,
+    border: str,
+) -> None:
+    if width < 4 or height < 4:
+        return
+    canvas.configure(bg=page_bg)
+    canvas.delete("card_bg")
+    draw_round_rect(canvas, 0, 0, width, height, radius, fill=border, tags="card_bg")
+    draw_round_rect(canvas, 1, 1, width - 1, height - 1, max(1, radius - 1), fill=card_fill, tags="card_bg")
+    canvas.tag_lower("card_bg")
+    inset = radius + 1
+    inner_w = max(width - 2 * inset, 1)
+    inner_h = max(height - 2 * inset, 1)
+    canvas.coords(win, inset, inset)
+    canvas.itemconfigure(win, width=inner_w, height=inner_h)
+
+
 def make_card(parent: tk.Misc, colors: dict[str, str], *, padding: int | None = None) -> tk.Frame:
-    """Raised surface with 1px border — standard card pattern."""
+    """Raised surface with rounded corners."""
+    return _make_round_surface(
+        parent, colors, padding=padding, fill=colors["card"], page_bg=colors["bg"],
+    )
+
+
+def make_round_surface(
+    parent: tk.Misc,
+    colors: dict[str, str],
+    *,
+    padding: int | None = None,
+    fill: str | None = None,
+    page_bg: str | None = None,
+    border: str | None = None,
+    fixed_height: int | None = None,
+) -> tk.Frame:
+    """Rounded panel shell (tab outlines, toasts, etc.)."""
+    return _make_round_surface(
+        parent,
+        colors,
+        padding=padding,
+        fill=fill or colors["bg"],
+        page_bg=page_bg or colors["bg"],
+        border=border or colors["border"],
+        fixed_height=fixed_height,
+    )
+
+
+def _make_round_surface(
+    parent: tk.Misc,
+    colors: dict[str, str],
+    *,
+    padding: int | None,
+    fill: str,
+    page_bg: str,
+    border: str | None = None,
+    fixed_height: int | None = None,
+) -> tk.Frame:
     scale = float(colors.get("_scale", "1"))
     pad = padding if padding is not None else space(4, scale)
-    outer = tk.Frame(parent, bg=colors["border_subtle"])
-    inner = tk.Frame(outer, bg=colors["card"])
-    inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+    r = corner_radius(scale)
+    border = border or colors["border_subtle"]
+
+    outer = tk.Frame(parent, bg=page_bg)
+    canvas = tk.Canvas(outer, bg=page_bg, highlightthickness=0, bd=0)
+    canvas.pack(fill=tk.BOTH, expand=True)
+    if fixed_height is not None:
+        canvas.configure(height=fixed_height)
+
+    inner = tk.Frame(canvas, bg=fill)
     inner._card_pad = pad  # type: ignore[attr-defined]
+    win = canvas.create_window(0, 0, window=inner, anchor="nw")
+    state = {"w": 0, "h": 0}
+
+    def _paint(w: int, h: int) -> None:
+        locked = getattr(outer, "_fixed_height", None)
+        if locked is not None:
+            h = locked
+        if w < 4 or h < 4:
+            return
+        if w == state["w"] and h == state["h"]:
+            return
+        state["w"], state["h"] = w, h
+        _paint_round_card(canvas, win, inner, width=w, height=h, radius=r, page_bg=page_bg, card_fill=fill, border=border)
+
+    def _on_canvas_configure(event) -> None:
+        if event.width <= 1 or event.height <= 1:
+            return
+        locked = getattr(outer, "_fixed_height", None)
+        h = locked if locked is not None else max(event.height, 1)
+        _paint(max(event.width, 1), h)
+
+    def _on_inner_configure(_event=None) -> None:
+        if getattr(outer, "_fixed_height", None) is not None:
+            return
+        inner.update_idletasks()
+        min_h = inner.winfo_reqheight() + 2 * (r + 1)
+        cur_h = max(canvas.winfo_height(), 1)
+        if min_h > cur_h:
+            canvas.configure(height=min_h)
+            _paint(max(canvas.winfo_width(), 1), min_h)
+
+    canvas.bind("<Configure>", _on_canvas_configure)
+    if fixed_height is None:
+        inner.bind("<Configure>", _on_inner_configure, add="+")
     outer._card_inner = inner  # type: ignore[attr-defined]
+    outer._card_canvas = canvas  # type: ignore[attr-defined]
+    outer._fixed_height = fixed_height  # type: ignore[attr-defined]
     return outer
 
 
-def make_accent_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> tk.Button:
+def fit_round_surface_to_content(shell: tk.Frame, *, scale: float = 1.0) -> int:
+    """Resize a round-surface canvas to hug its inner frame (grow or shrink)."""
+    canvas = shell._card_canvas  # type: ignore[attr-defined]
+    inner = shell._card_inner  # type: ignore[attr-defined]
+    inner.update_idletasks()
+    r = corner_radius(scale)
+    min_h = max(inner.winfo_reqheight() + 2 * (r + 1), 4)
+    try:
+        canvas.configure(height=min_h)
+        w = max(canvas.winfo_width(), 1)
+        if w >= 4 and min_h >= 4:
+            canvas.event_generate("<Configure>")
+    except tk.TclError:
+        pass
+    return min_h
+
+
+def set_round_surface_height(shell: tk.Frame, height: int) -> None:
+    """Update a round surface created with fixed-height locking."""
+    shell._fixed_height = max(height, 1)  # type: ignore[attr-defined]
+    canvas = shell._card_canvas  # type: ignore[attr-defined]
+    try:
+        canvas.configure(height=shell._fixed_height)  # type: ignore[attr-defined]
+        w = max(canvas.winfo_width(), 1)
+        h = shell._fixed_height  # type: ignore[attr-defined]
+        if w >= 4 and h >= 4:
+            canvas.event_generate("<Configure>")
+    except tk.TclError:
+        pass
+
+
+def button_corner_radius(scale: float = 1.0) -> int:
+    return max(6, int(8 * scale))
+
+
+def _widget_bg(widget: tk.Misc) -> str:
+    try:
+        bg = widget.cget("bg")
+        if bg:
+            return bg
+    except tk.TclError:
+        pass
+    return "#1a1a24"
+
+
+class CanvasButton(tk.Frame):
+    """Rounded push button — tk.Button corners are square on Windows."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command,
+        *,
+        colors: dict[str, str],
+        variant: str = "secondary",
+        font_role: str = "label",
+        font_weight: str | None = None,
+        pad_x: int | None = None,
+        pad_y: int | None = None,
+    ) -> None:
+        super().__init__(parent, bg=_widget_bg(parent))
+        self._colors = colors
+        self._command = command
+        self._text = text
+        self._variant = variant
+        self._font_role = font_role
+        self._font_weight = font_weight
+        self._scale = float(colors.get("_scale", "1"))
+        self._pad_x = pad_x if pad_x is not None else space(4, self._scale)
+        self._pad_y = pad_y if pad_y is not None else space(2, self._scale)
+        self._state = tk.NORMAL
+        self._hover = False
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, cursor="hand2")
+        self._canvas.pack()
+        self._canvas.bind("<Button-1>", self._on_click)
+        self._canvas.bind("<Enter>", self._on_enter)
+        self._canvas.bind("<Leave>", self._on_leave)
+        self.after_idle(self._redraw)
+
+    def _font(self) -> tkfont.Font:
+        weight = self._font_weight or "normal"
+        return tkfont.Font(font=typeface(self._font_role, self._scale, weight=weight))
+
+    def _palette(self) -> tuple[str, str, str]:
+        c = self._colors
+        disabled = self._state == tk.DISABLED
+        if self._variant == "accent":
+            if disabled:
+                return c["border_subtle"], c["muted"], c["border_subtle"]
+            bg = c["accent_hover"] if self._hover else c["accent"]
+            return bg, "#ffffff", bg
+        if self._variant == "browse":
+            if disabled:
+                return c["surface"], c["muted"], c["border"]
+            bg = c["browse_hover"] if self._hover else c["browse_bg"]
+            return bg, c["browse_fg"] if not self._hover else c["text"], c["border"]
+        if self._variant == "ghost":
+            if disabled:
+                return _widget_bg(self), c["muted"], _widget_bg(self)
+            bg = c["surface"] if self._hover else c["bg"]
+            fg = c["text"] if self._hover else c["muted"]
+            return bg, fg, bg
+        if self._variant == "compact":
+            if disabled:
+                return c["surface"], c["muted"], c["border"]
+            bg = c["card_hover"] if self._hover else c["surface"]
+            border = c["accent"] if self._hover and not disabled else c["border"]
+            return bg, c["hero_kicker"], border
+        if self._variant == "player":
+            if disabled:
+                return c["card"], c["muted"], c["border_subtle"]
+            bg = c["card_hover"] if self._hover else c["card"]
+            fg = c["accent"] if self._hover else c["text"]
+            return bg, fg, c["border_subtle"]
+        if self._variant == "icon":
+            if disabled:
+                return _widget_bg(self), c["muted"], _widget_bg(self)
+            bg = c["surface"] if self._hover else _widget_bg(self)
+            return bg, c["text"] if self._hover else c["muted"], c["border_subtle"]
+        # secondary
+        if disabled:
+            return c["surface"], c["muted"], c["border"]
+        bg = c["card_hover"] if self._hover else c["surface"]
+        border = c["accent"] if self._hover else c["border"]
+        return bg, c["text"], border
+
+    def _redraw(self) -> None:
+        try:
+            font = self._font()
+            tw = font.measure(self._text)
+            th = font.metrics("linespace")
+            w = max(tw + 2 * self._pad_x, 8)
+            h = max(th + 2 * self._pad_y, 8)
+            self._canvas.configure(width=w, height=h, bg=_widget_bg(self))
+            self._canvas.delete("all")
+            fill, fg, outline = self._palette()
+            r = button_corner_radius(self._scale)
+            draw_round_rect(self._canvas, 1, 1, w - 1, h - 1, r, fill=fill, outline=outline, width=1)
+            self._canvas.create_text(w / 2, h / 2, text=self._text, fill=fg, font=font)
+            cursor = "arrow" if self._state == tk.DISABLED else "hand2"
+            self._canvas.configure(cursor=cursor)
+        except tk.TclError:
+            pass
+
+    def _on_click(self, _event=None) -> None:
+        if self._state != tk.DISABLED and self._command:
+            self._command()
+
+    def _on_enter(self, _event=None) -> None:
+        if self._state != tk.DISABLED:
+            self._hover = True
+            self._redraw()
+
+    def _on_leave(self, _event=None) -> None:
+        self._hover = False
+        self._redraw()
+
+    def configure(self, cnf=None, **kw) -> None:
+        if cnf:
+            kw = {**cnf, **kw}
+        if "text" in kw:
+            self._text = kw.pop("text")
+        if "state" in kw:
+            self._state = kw.pop("state")
+            if self._state == tk.DISABLED:
+                self._hover = False
+        if "bg" in kw:
+            super().configure(bg=kw.pop("bg"))
+        kw.pop("fg", None)
+        kw.pop("padx", None)
+        kw.pop("pady", None)
+        kw.pop("highlightbackground", None)
+        if kw:
+            super().configure(**kw)
+        self._redraw()
+
+    config = configure
+
+    def cget(self, key: str):
+        if key == "state":
+            return self._state
+        if key == "text":
+            return self._text
+        return super().cget(key)
+
+    def __getitem__(self, key: str):
+        return self.cget(key)
+
+    def __setitem__(self, key: str, value) -> None:
+        self.configure(**{key: value})
+
+    def bind(self, sequence=None, func=None, add=None):
+        return self._canvas.bind(sequence, func, add)
+
+
+def make_accent_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> CanvasButton:
     scale = float(colors.get("_scale", "1"))
-    btn = tk.Button(
-        parent, text=text, command=command,
-        bg=colors["accent"], fg="#ffffff",
-        activebackground=colors["accent_hover"], activeforeground="#ffffff",
-        relief=tk.FLAT, bd=0,
-        padx=space(5, scale), pady=space(2, scale),
-        cursor="hand2",
-        font=typeface("button", scale, weight="bold"),
+    return CanvasButton(
+        parent, text, command, colors=colors, variant="accent",
+        font_role="button", font_weight="bold",
+        pad_x=space(5, scale), pad_y=space(2, scale),
     )
-    track_font(btn, "button", colors, weight="bold")
-
-    def on_enter(_e) -> None:
-        if str(btn["state"]) != tk.DISABLED:
-            btn.configure(bg=colors["accent_hover"])
-
-    def on_leave(_e) -> None:
-        if str(btn["state"]) != tk.DISABLED:
-            btn.configure(bg=colors["accent"])
-
-    btn.bind("<Enter>", on_enter)
-    btn.bind("<Leave>", on_leave)
-    return btn
 
 
 def make_path_entry(parent: tk.Misc, variable: tk.StringVar, colors: dict[str, str]) -> tk.Entry:
@@ -495,86 +948,43 @@ def make_path_entry(parent: tk.Misc, variable: tk.StringVar, colors: dict[str, s
         highlightbackground=colors["border"],
         highlightcolor=colors["accent"],
         font=typeface("body", scale),
+        insertwidth=1,
     )
     track_font(entry, "body", colors)
     return entry
 
 
-def make_browse_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> tk.Button:
+def make_browse_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> CanvasButton:
     scale = float(colors.get("_scale", "1"))
-    btn = tk.Button(
-        parent, text=text, command=command,
-        bg=colors["browse_bg"], fg=colors["browse_fg"],
-        activebackground=colors["browse_hover"], activeforeground=colors["text"],
-        relief=tk.FLAT, bd=0,
-        padx=space(3, scale), pady=space(2, scale),
-        highlightthickness=0,
-        cursor="hand2", font=typeface("label", scale),
+    return CanvasButton(
+        parent, text, command, colors=colors, variant="browse",
+        font_role="label", pad_x=space(3, scale), pad_y=space(2, scale),
     )
-    track_font(btn, "label", colors)
-
-    def on_enter(_e) -> None:
-        btn.configure(bg=colors["browse_hover"])
-
-    def on_leave(_e) -> None:
-        btn.configure(bg=colors["browse_bg"])
-
-    btn.bind("<Enter>", on_enter)
-    btn.bind("<Leave>", on_leave)
-    return btn
 
 
-def make_secondary_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> tk.Button:
+def make_secondary_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> CanvasButton:
     scale = float(colors.get("_scale", "1"))
-    btn = tk.Button(
-        parent, text=text, command=command,
-        bg=colors["surface"], fg=colors["text"],
-        activebackground=colors["card_hover"], activeforeground=colors["text"],
-        relief=tk.FLAT, bd=0,
-        padx=space(4, scale), pady=space(2, scale),
-        highlightthickness=1,
-        highlightbackground=colors["border"],
-        highlightcolor=colors["border"],
-        cursor="hand2", font=typeface("label", scale),
+    return CanvasButton(
+        parent, text, command, colors=colors, variant="secondary",
+        font_role="label", pad_x=space(4, scale), pad_y=space(2, scale),
     )
-    track_font(btn, "label", colors)
-
-    def on_enter(_e) -> None:
-        if str(btn["state"]) != tk.DISABLED:
-            btn.configure(bg=colors["card_hover"], highlightbackground=colors["accent"])
-
-    def on_leave(_e) -> None:
-        if str(btn["state"]) != tk.DISABLED:
-            btn.configure(bg=colors["surface"], highlightbackground=colors["border"])
-
-    btn.bind("<Enter>", on_enter)
-    btn.bind("<Leave>", on_leave)
-    return btn
 
 
-def make_ghost_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> tk.Button:
+def make_ghost_button(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> CanvasButton:
     scale = float(colors.get("_scale", "1"))
-    btn = tk.Button(
-        parent, text=text, command=command,
-        bg=colors["bg"], fg=colors["muted"],
-        activebackground=colors["surface"], activeforeground=colors["text"],
-        relief=tk.FLAT, bd=0,
-        padx=space(3, scale), pady=space(2, scale),
-        cursor="hand2", font=typeface("caption", scale),
+    return CanvasButton(
+        parent, text, command, colors=colors, variant="ghost",
+        font_role="caption", pad_x=space(3, scale), pad_y=space(2, scale),
     )
-    track_font(btn, "caption", colors)
 
-    def on_enter(_e) -> None:
-        if str(btn["state"]) != tk.DISABLED:
-            btn.configure(bg=colors["surface"], fg=colors["text"])
 
-    def on_leave(_e) -> None:
-        if str(btn["state"]) != tk.DISABLED:
-            btn.configure(bg=colors["bg"], fg=colors["muted"])
-
-    btn.bind("<Enter>", on_enter)
-    btn.bind("<Leave>", on_leave)
-    return btn
+def make_compact_dropdown(parent: tk.Misc, text: str, command, colors: dict[str, str]) -> CanvasButton:
+    """Small agent-style dropdown trigger (label + ▾)."""
+    scale = float(colors.get("_scale", "1"))
+    return CanvasButton(
+        parent, f"{text}  \u25be", command, colors=colors, variant="compact",
+        font_role="caption", pad_x=space(3, scale), pad_y=space(2, scale),
+    )
 
 
 def configure_log_widget(widget: tk.Text, colors: dict[str, str]) -> None:
@@ -612,8 +1022,5 @@ def set_window_icon(root: tk.Tk) -> None:
         pass
 
 
-def set_accent_button_state(btn: tk.Button, colors: dict[str, str], *, enabled: bool) -> None:
-    if enabled:
-        btn.configure(state=tk.NORMAL, bg=colors["accent"], fg="#ffffff")
-    else:
-        btn.configure(state=tk.DISABLED, bg=colors["border_subtle"], fg=colors["muted"])
+def set_accent_button_state(btn: tk.Misc, colors: dict[str, str], *, enabled: bool) -> None:
+    btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)

@@ -10,22 +10,34 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, scrolledtext, ttk
+from tkinter import filedialog, font as tkfont, scrolledtext, ttk
 
 from novelflow.gui_theme import (
     apply_theme,
     configure_dark_combobox,
+    configure_gutter_grid,
     configure_log_widget,
+    control_metrics,
+    corner_radius,
+    draw_round_rect,
+    draw_round_rect_top,
     enable_dpi_awareness,
+    fit_combobox,
+    fit_round_surface_to_content,
+    CanvasButton,
     make_accent_button,
     make_browse_button,
     make_card,
+    make_compact_dropdown,
     make_ghost_button,
     make_path_entry,
+    make_round_surface,
     make_secondary_button,
     refresh_font_registry,
     refresh_theme_scale,
     set_accent_button_state,
+    set_grid_column_gaps,
+    set_round_surface_height,
     set_window_icon,
     space,
     track_font,
@@ -55,9 +67,12 @@ _SECTION_PRESETS = (
     "None",
 )
 _SECTION_PRESET_DEFAULT = "Title + chapters"
+_PLAYER_CHAPTER_TITLE_PLACEHOLDER = "Chapter title"
+_PLAYER_CHAPTER_SUB_PLACEHOLDER = "—"
 
 # Tab content fills the main area; progress lives in the footer.
 _MAIN_SPLIT_TAB_ROW = 0
+_TAB_NAV_DEFS = (("📄", "Document"), ("🎧", "Audiobook"), ("▶", "Player"))
 
 
 class ReflowBar(ttk.Frame):
@@ -92,8 +107,23 @@ class ReflowBar(ttk.Frame):
 
     def _reflow_inner(self) -> None:
         width = self.winfo_width()
-        if width <= 1 or not self._buttons:
+        if not self._buttons:
             return
+        if width <= 1:
+            self._reflowing = True
+            try:
+                est = sum(
+                    btn.winfo_reqwidth() + self._gap for btn in self._buttons
+                ) or width
+                width = max(width, est)
+                if width <= 1:
+                    for col, btn in enumerate(self._buttons):
+                        btn.grid(row=0, column=col, sticky="w", padx=(0, self._gap), pady=(0, self._gap))
+                    self._last_layout = tuple((0, c, "w") for c in range(len(self._buttons)))
+                    self.after_idle(self._reflow)
+                    return
+            finally:
+                self._reflowing = False
         # Compute the (row, col) grid positions first.
         placements: list[tuple[int, int, str]] = []
         x = 0
@@ -155,6 +185,8 @@ class NovelflowApp(tk.Tk):
         self._sections_frame: ttk.Frame | None = None
         self._audiobook_tab_page: ttk.Frame | None = None
         self._sections_picker: tk.Toplevel | None = None
+        self._doc_advanced_popup: tk.Toplevel | None = None
+        self._doc_adv_popup_open = False
         self.section_search_var = tk.StringVar()
         self._picker_search_var = tk.StringVar()
         self.section_preset_var = tk.StringVar(value=_SECTION_PRESET_DEFAULT)
@@ -164,6 +196,8 @@ class NovelflowApp(tk.Tk):
         self.status_var = tk.StringVar(value="Ready — choose a PDF or markdown file to begin")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_meta_var = tk.StringVar(value="")
+        self._footer_title_var = tk.StringVar(value="")
+        self._footer_progress_style = "idle"
         self._current_progress_pct = 0.0
         self._current_progress_label = ""
 
@@ -186,8 +220,8 @@ class NovelflowApp(tk.Tk):
         self._player_started = False
         self._resume_fraction = 0.0
         self.player_title_var = tk.StringVar(value="No audiobook loaded yet")
-        self.player_chapter_title_var = tk.StringVar(value="")
-        self.player_chapter_sub_var = tk.StringVar(value="")
+        self.player_chapter_title_var = tk.StringVar(value=_PLAYER_CHAPTER_TITLE_PLACEHOLDER)
+        self.player_chapter_sub_var = tk.StringVar(value=_PLAYER_CHAPTER_SUB_PLACEHOLDER)
         self.player_chapter_elapsed_var = tk.StringVar(value="00:00")
         self.player_chapter_total_var = tk.StringVar(value="00:00")
         self.player_book_elapsed_var = tk.StringVar(value="00:00")
@@ -210,6 +244,9 @@ class NovelflowApp(tk.Tk):
         )
         self.audiobook_lib_pick_var = tk.StringVar(value="")
         self._audiobook_lib_entries: list[tuple[str, Path]] = []
+        self._workflow_sync_after: str | None = None
+        self.output_var.trace_add("write", lambda *_: self._schedule_workflow_sync())
+        self.audio_format_var.trace_add("write", lambda *_: self._schedule_workflow_sync())
 
         self._build_ui()
         self.bind("<Configure>", self._on_window_resize)
@@ -290,26 +327,107 @@ class NovelflowApp(tk.Tk):
         self._ui_scale = new_scale
         self.colors = refresh_theme_scale(self, self.colors, new_scale)
         self._refresh_footer_theme()
+        self._work_tab_size_key = None
+        self._doc_drop_measure_key = None
+        self._sync_form_control_sizes()
+        if hasattr(self, "_player_strip"):
+            set_grid_column_gaps(
+                self._player_strip,
+                self._player_strip_gap_units,
+                scale=new_scale,
+                gap_columns=self._player_strip_gap_cols,
+            )
 
-    def _refresh_footer_theme(self) -> None:
-        if not hasattr(self, "_footer_container"):
+    def _sync_form_control_sizes(self) -> None:
+        if not hasattr(self, "voice_combo"):
             return
-        c = self.colors
-        for widget in (self._footer_container, self._footer_inner, self._status_label):
+        scale = self._ui_scale
+        from novelflow.tts_voices import voices_for_engine
+
+        labels = tuple(f"{v.label} ({v.id})" for v in voices_for_engine("edge"))
+        fit_combobox(self.voice_combo, labels, scale=scale, min_chars=18, max_chars=32)
+        fit_combobox(
+            self.format_combo, ("m4b", "mp3", "m4a"), scale=scale, min_chars=6, max_chars=8,
+        )
+        fit_combobox(
+            self.section_preset_combo, _SECTION_PRESETS, scale=scale, min_chars=14, max_chars=22,
+        )
+        self._sync_drop_zone_height(force=True)
+
+    def _drop_zone_canvas_inset(self) -> int:
+        return 2 * (corner_radius(self._ui_scale) + 1)
+
+    def _sync_drop_zone_height(self, *, force: bool = False) -> None:
+        """Match drop-zone canvas height to the Audiobook content row."""
+        if not hasattr(self, "_doc_drop_shell"):
+            return
+        scale = self._ui_scale
+        measure_key = (round(scale, 3), self.winfo_width(), self.winfo_height())
+        inset = self._drop_zone_canvas_inset()
+
+        if force or getattr(self, "_doc_drop_measure_key", None) != measure_key:
+            self._doc_empty_content.update_idletasks()
+            self._doc_selected_content.update_idletasks()
+            content_max = max(
+                self._doc_empty_content.winfo_reqheight(),
+                self._doc_selected_content.winfo_reqheight(),
+            )
+            floor = content_max + inset
+            matched = None
+            if hasattr(self, "_audio_work_content"):
+                self._audio_work_content.update_idletasks()
+                matched = self._audio_work_content.winfo_reqheight()
+            canvas_h = max(floor, matched) if matched is not None else floor
+            self._doc_drop_zone_height = canvas_h
+            self._doc_drop_measure_key = measure_key
+        else:
+            canvas_h = getattr(self, "_doc_drop_zone_height", inset + space(12, scale))
+
+        set_round_surface_height(self._doc_drop_shell, canvas_h)
+
+    def _fit_work_tab_cards(self) -> None:
+        """Shrink grey card canvases to body content (they only auto-grow today)."""
+        scale = self._ui_scale
+        for card in (getattr(self, "_doc_card", None), getattr(self, "_audio_card", None)):
+            if card is not None:
+                fit_round_surface_to_content(card, scale=scale)
+
+    def _reflow_action_bars(self) -> None:
+        for bar in self._reflow_bars:
             try:
-                widget.configure(bg=c["surface"])
+                bar.reflow()
             except tk.TclError:
                 pass
-        for widget in (self._footer_progress_frame, self._footer_progress_pct):
-            try:
-                widget.configure(bg=c["surface"])
-            except tk.TclError:
-                pass
+
+    def _footer_metrics(self) -> dict[str, int]:
+        """Footer download bar — ~7% of window height."""
+        scale = self._ui_scale
+        win_h = max(self.winfo_height(), 1)
+        base = space(2, scale) * 2 + space(6, scale) + space(2, scale)
+        return {
+            "height": max(base, int(win_h * 0.07)),
+            "btn_pad_x": space(3, scale),
+            "btn_pad_y": space(2, scale),
+        }
+
+    def _sync_footer_layout(self) -> None:
+        if not hasattr(self, "_footer_canvas"):
+            return
+        m = self._footer_metrics()
         try:
-            self._footer_border.configure(bg=c["border"])
-            self._status_label.configure(fg=c["muted"])
+            self._footer_canvas.configure(height=m["height"])
+            self._draw_footer_bar()
         except tk.TclError:
             pass
+
+    def _refresh_footer_theme(self) -> None:
+        if not hasattr(self, "_footer_canvas"):
+            return
+        self._sync_footer_layout()
+
+    def _apply_progress_style(self, style: str) -> None:
+        self._footer_progress_style = style
+        self._draw_footer_bar()
 
     # ---- layout -------------------------------------------------------------
 
@@ -327,36 +445,27 @@ class NovelflowApp(tk.Tk):
 
         self._content_gutter = ttk.Frame(self._main_split)
         self._content_gutter.grid(row=_MAIN_SPLIT_TAB_ROW, column=0, sticky="nsew")
-        pad = space(5, self._ui_scale)
-        self._content_lane_pad = pad
-        self._content_frame = ttk.Frame(self._content_gutter, padding=(pad, pad, pad, 0))
-        self._content_frame.pack(fill=tk.BOTH, expand=True)
+        self._content_gutter.columnconfigure(1, weight=1)
+        self._content_gutter.rowconfigure(0, weight=1)
+        self._content_lane_pad: int | None = None
+        self._tab_pad = 0
 
-        self.notebook = ttk.Notebook(self._content_frame)
-        self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        self._tab_pad = space(4, self._ui_scale)
         self._doc_log_host: ttk.Frame | None = None
         self._audio_log_host: ttk.Frame | None = None
 
-        tab_pad = self._tab_pad
-        doc_page = ttk.Frame(self.notebook, padding=tab_pad)
-        audio_page = ttk.Frame(self.notebook, padding=tab_pad)
-        player_page = ttk.Frame(self.notebook, padding=tab_pad)
-        self.notebook.add(doc_page, text="  📄 Document  ")
-        self.notebook.add(audio_page, text="  🎧 Audiobook  ")
-        self.notebook.add(player_page, text="  ▶ Player  ")
-        self.notebook.bind(
-            "<<NotebookTabChanged>>",
-            lambda _e: (self._update_stepper(), self._sync_bottom_panel_for_tab()),
-        )
+        self._build_tab_nav(self._content_gutter)
+        doc_page, audio_page, player_page = self._tab_pages
 
         self._build_document_tab(doc_page)
         self._build_audiobook_tab(audio_page)
+        self.after_idle(lambda: self._sync_drop_zone_height(force=True))
         self._log_panels: list[dict[str, tk.Misc]] = []
         self._build_activity_log_panel(self._doc_log_host)
         self._build_activity_log_panel(self._audio_log_host)
         self.log = self._log_panels[0]["text"]  # type: ignore[assignment]
+        self._log_user_override = None
+        self._log_collapsed = False
+        self._set_log_collapsed(True)
         self._build_player_tab(player_page)
 
         self.after_idle(self._sync_bottom_panel_for_tab)
@@ -366,7 +475,7 @@ class NovelflowApp(tk.Tk):
         self._register_window_dnd()
         refresh_font_registry(self.colors, self._ui_scale)
         self._apply_content_gutter(self.winfo_width())
-        self._update_stepper()
+        self.after_idle(self._sync_footer_layout)
 
     def _build_hero(self, parent: ttk.Frame) -> None:
         hero_bg = self.colors["hero_bg"]
@@ -386,35 +495,142 @@ class NovelflowApp(tk.Tk):
         title.pack(fill=tk.X)
         track_font(title, "title", self.colors, weight="bold")
 
-        steps_row = tk.Frame(inner, bg=hero_bg)
-        steps_row.pack(fill=tk.X, pady=(space(2, self._ui_scale), 0))
-        self._step_labels: list[tk.Label] = []
-        for idx, name in enumerate(("Document", "Audiobook", "Player")):
-            if idx:
-                sep = tk.Label(steps_row, text="  ›  ", bg=hero_bg, fg=self.colors["muted"])
-                sep.pack(side=tk.LEFT)
-                track_font(sep, "step", self.colors)
-            lbl = tk.Label(
-                steps_row, text=f"{idx + 1} · {name}", bg=hero_bg,
-                fg=self.colors["muted"], cursor="hand2",
-            )
-            lbl.pack(side=tk.LEFT)
-            track_font(lbl, "step", self.colors, weight="bold")
-            lbl.bind("<Button-1>", lambda _e, i=idx: self.notebook.select(i))
-            self._step_labels.append(lbl)
-
         self._accent_bar = tk.Frame(hero, bg=self.colors["accent"], height=2)
         self._accent_bar.pack(fill=tk.X)
 
-    def _update_stepper(self) -> None:
-        if not getattr(self, "_step_labels", None):
+    def _select_tab(self, index: int) -> None:
+        if not (0 <= index < len(self._tab_pages)):
             return
+        self._tab_index = index
+        self._tab_pages[index].tkraise()
+        accent = self.colors["accent"]
+        surface = self.colors["surface"]
+        muted = self.colors["muted"]
+        for i, (item, icon_lbl, name_lbl) in enumerate(getattr(self, "_tab_nav_items", ())):
+            active = i == index
+            bg = accent if active else surface
+            fg = "#ffffff" if active else muted
+            item.configure(bg=bg)
+            icon_lbl.configure(bg=bg, fg=fg)
+            name_lbl.configure(bg=bg, fg=fg)
+        self._sync_bottom_panel_for_tab()
+
+    def _tab_nav_metrics(self) -> dict[str, int]:
+        """Scaled sizes for the icon + label sidebar rail."""
+        scale = self._ui_scale
+        label_font = tkfont.Font(font=typeface("caption", scale))
+        text_w = max((label_font.measure(label) for _icon, label in _TAB_NAV_DEFS), default=0)
+        return {
+            "sidebar_w": max(space(16, scale), text_w + space(4, scale)),
+            "item_pad_y": space(4, scale),
+            "icon_name_gap": space(1, scale),
+            "top_pad": space(4, scale),
+            "side": space(2, scale),
+        }
+
+    def _make_tab_nav_item(self, parent: tk.Misc, idx: int, icon: str, label: str) -> tuple[tk.Frame, tk.Label, tk.Label]:
+        m = self._tab_nav_metrics()
+        scale = self._ui_scale
+        surface = self.colors["surface"]
+        side = m["side"]
+        if idx > 0:
+            rule = tk.Frame(parent, bg=self.colors["border"], height=1)
+            rule.pack(fill=tk.X, padx=side, pady=(0, m["item_pad_y"]))
+            self._tab_nav_dividers.append(rule)
+        item = tk.Frame(parent, bg=surface, cursor="hand2")
+        item.pack(fill=tk.X, padx=side, pady=(0, m["item_pad_y"]))
+        icon_lbl = tk.Label(
+            item, text=icon, bg=surface, fg=self.colors["muted"],
+            font=typeface("title", scale), cursor="hand2",
+        )
+        icon_lbl.pack()
+        name_lbl = tk.Label(
+            item, text=label, bg=surface, fg=self.colors["muted"],
+            font=typeface("caption", scale), cursor="hand2",
+        )
+        name_lbl.pack(pady=(m["icon_name_gap"], 0))
+
+        def _select(_event=None, i=idx) -> None:
+            self._select_tab(i)
+
+        for widget in (item, icon_lbl, name_lbl):
+            widget.bind("<Button-1>", _select)
+        return item, icon_lbl, name_lbl
+
+    def _build_tab_nav(self, parent: tk.Misc) -> None:
+        """Vertical sidebar: icon with section name stacked below."""
+        m = self._tab_nav_metrics()
+        self._sidebar_width = m["sidebar_w"]
+        self._tab_index = 0
+
+        self._sidebar = tk.Frame(parent, bg=self.colors["surface"], width=self._sidebar_width)
+        self._sidebar.grid(row=0, column=0, sticky="ns")
+        self._sidebar.grid_propagate(False)
+        self._sidebar.bind("<Configure>", self._sync_sidebar_fill, add="+")
+        self._sidebar_fill = tk.Frame(self._sidebar, bg=self.colors["surface"])
+        self._sidebar_fill.place(x=0, y=0, relwidth=1, relheight=1)
+        self._icon_lane = tk.Frame(self._sidebar, bg=self.colors["surface"])
+        self._icon_lane.place(x=0, y=0, relwidth=1, anchor="nw")
+        self._sidebar_rule = tk.Frame(self._sidebar, bg=self.colors["border"], width=1)
+        self._sidebar_rule.place(relx=1.0, rely=0, relheight=1, anchor="ne", width=1)
+
+        lane_pad = self._content_body_pad()
+        self._page_host = ttk.Frame(parent, style="TFrame")
+        self._page_host.grid(row=0, column=1, sticky="nsew", padx=(lane_pad, lane_pad), pady=(lane_pad, lane_pad))
+
+        self._tab_nav_items: list[tuple[tk.Frame, tk.Label, tk.Label]] = []
+        self._tab_nav_dividers: list[tk.Frame] = []
+        self._tab_pages: list[ttk.Frame] = []
+
+        nav_side = m["side"]
+        top_pad = tk.Frame(self._icon_lane, bg=self.colors["surface"], height=m["top_pad"])
+        top_pad.pack(fill=tk.X)
+        top_pad.pack_propagate(False)
+        self._tab_nav_top_rule = tk.Frame(self._icon_lane, bg=self.colors["border"], height=1)
+        self._tab_nav_top_rule.pack(fill=tk.X, padx=nav_side)
+
+        for idx, (icon, label) in enumerate(_TAB_NAV_DEFS):
+            self._tab_nav_items.append(self._make_tab_nav_item(self._icon_lane, idx, icon, label))
+            page = ttk.Frame(self._page_host, padding=self._tab_pad)
+            page.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._tab_pages.append(page)
+
+        self._tab_nav_bottom_rule = tk.Frame(self._icon_lane, bg=self.colors["border"], height=1)
+        self._tab_nav_bottom_rule.pack(fill=tk.X, padx=nav_side, pady=(0, space(2, self._ui_scale)))
+
+        self._select_tab(0)
+
+    def _sync_tab_nav_layout(self) -> None:
+        if not hasattr(self, "_sidebar"):
+            return
+        m = self._tab_nav_metrics()
+        if m["sidebar_w"] != self._sidebar_width:
+            self._sidebar_width = m["sidebar_w"]
+            self._sidebar.configure(width=self._sidebar_width)
+        icon_font = typeface("title", self._ui_scale)
+        name_font = typeface("caption", self._ui_scale)
+        for _item, icon_lbl, name_lbl in getattr(self, "_tab_nav_items", ()):
+            icon_lbl.configure(font=icon_font)
+            name_lbl.configure(font=name_font)
+        self._sync_form_control_sizes()
+
+    def _sync_sidebar_fill(self, _event=None) -> None:
         try:
-            active = self.notebook.index(self.notebook.select())
+            self._sidebar_fill.place_configure(x=0, y=0, relwidth=1, relheight=1)
+            self._sidebar_rule.place_configure(relx=1.0, rely=0, relheight=1, anchor="ne", width=1)
         except tk.TclError:
-            return
-        for idx, lbl in enumerate(self._step_labels):
-            lbl.configure(fg=self.colors["glow"] if idx == active else self.colors["muted"])
+            pass
+
+    @property
+    def notebook(self):
+        """Compatibility shim for code that selects tabs by index."""
+        return self
+
+    def select(self, index: int) -> None:
+        self._select_tab(index)
+
+    def index(self, _tab_id=None) -> int:
+        return self._tab_index
 
     def _on_window_resize(self, event) -> None:
         if event.widget is not self:
@@ -460,6 +676,8 @@ class NovelflowApp(tk.Tk):
         height = max(self.winfo_height(), 1)
         self._apply_content_gutter(width)
         self._update_ui_scale(force=height < 560 or width < 640)
+        self._sync_tab_nav_layout()
+        self._sync_footer_layout()
         if hasattr(self, "_log_panels"):
             lines = self._log_lines_for_height(height)
             for panel in self._log_panels:
@@ -476,97 +694,252 @@ class NovelflowApp(tk.Tk):
                 bar.reflow()
             except tk.TclError:
                 pass
+        self._sync_work_tab_heights()
+        self._sync_player_chrome_layout()
+        self._sync_drop_zone_height()
+        self.after_idle(self._reflow_action_bars)
 
-    def _apply_content_gutter(self, window_width: int) -> None:
-        if not hasattr(self, "_content_frame"):
+    def _sync_work_tab_heights(self) -> None:
+        """Match Document / Audiobook card heights so activity logs align."""
+        if not hasattr(self, "_doc_card") or not hasattr(self, "_audio_card"):
             return
-        if window_width < 640:
-            pad = space(2, self._ui_scale)
-        elif window_width < 900:
-            pad = space(3, self._ui_scale)
-        else:
-            pad = max(space(4, self._ui_scale), int(window_width * 0.015))
-        if getattr(self, "_content_lane_pad", None) == pad:
-            return
-        self._content_lane_pad = pad
-        self._content_frame.pack_configure(padx=pad)
-
-    def _make_tab_outline(self, parent: ttk.Frame, *, expand: bool = False) -> tuple[ttk.Frame, tk.Frame]:
-        """Bordered shell; inner body uses the full outline width (no side columns)."""
-        shell = tk.Frame(
-            parent, bg=self.colors["bg"], highlightthickness=1,
-            highlightbackground=self.colors["border"], highlightcolor=self.colors["border"],
-        )
-        pad = space(4, self._ui_scale)
-        if expand:
-            shell.pack(fill=tk.BOTH, expand=True)
-            inner = ttk.Frame(shell, padding=pad)
-            inner.pack(fill=tk.BOTH, expand=True)
-        else:
-            shell.pack(fill=tk.X, anchor="n")
-            inner = ttk.Frame(shell, padding=pad)
-            inner.pack(fill=tk.X, anchor="n")
-        return inner, shell
-
-    def _apply_progress_style(self, style: str) -> None:
         try:
-            if hasattr(self, "_footer_progress"):
-                self._footer_progress.configure(style=style)
+            self._sync_drop_zone_height(force=True)
+            for top in (getattr(self, "_doc_work_top", None), getattr(self, "_audio_work_top", None)):
+                if top is not None:
+                    top.grid_configure(sticky="new")
+            self._fit_work_tab_cards()
+            self.update_idletasks()
+            if hasattr(self, "_doc_drop_shell"):
+                c = self._doc_drop_canvas
+                w, h = max(c.winfo_width(), 1), getattr(self._doc_drop_shell, "_fixed_height", None) or max(c.winfo_height(), 1)
+                if w >= 4 and h >= 4 and len(c.find_withtag("card_bg")) == 0:
+                    c.event_generate("<Configure>")
         except tk.TclError:
             pass
 
-    # ---- footer status bar (Cursor-style) -----------------------------------
+    def _content_body_pad(self, window_width: int | None = None) -> int:
+        """Uniform inset for tab body: sidebar edge → right edge, top → footer."""
+        scale = self._ui_scale
+        width = window_width if window_width is not None else max(self.winfo_width(), 1)
+        return space(2, scale) if width < 640 else space(3, scale)
+
+    def _apply_content_gutter(self, window_width: int) -> None:
+        if not hasattr(self, "_page_host"):
+            return
+        pad = self._content_body_pad(window_width)
+        if self._content_lane_pad == pad:
+            return
+        self._content_lane_pad = pad
+        self._page_host.grid_configure(padx=(pad, pad), pady=(pad, pad))
+
+    def _make_section_heading(self, parent: tk.Misc, text: str) -> ttk.Frame:
+        """Page-level section title with accent underline."""
+        block = ttk.Frame(parent)
+        ttk.Label(block, text=text, style="SectionHeading.TLabel").pack(anchor="w")
+        tk.Frame(block, bg=self.colors["accent"], height=2).pack(
+            fill=tk.X, pady=(space(1, self._ui_scale), 0),
+        )
+        return block
+
+    def _make_subsection_heading(self, parent: tk.Misc, text: str, **pack_kw) -> ttk.Label:
+        """In-page subsection title (e.g. Sections, Activity log)."""
+        lbl = ttk.Label(parent, text=text, style="SubsectionHeading.TLabel")
+        if pack_kw:
+            lbl.pack(**pack_kw)
+        return lbl
+
+    def _work_tab_shell_pad(self) -> str:
+        """Asymmetric inset for Document / Audiobook tab shells — tight top, room below."""
+        s = self._ui_scale
+        side = space(4, s)
+        return f"{side} {space(1, s)} {side} {space(4, s)}"
+
+    def _work_tab_subtitle_pady(self) -> tuple[int, int]:
+        s = self._ui_scale
+        return (space(1, s), space(2, s))
+
+    def _work_tab_action_gap(self) -> int:
+        return space(4, self._ui_scale)
+
+    def _work_tab_body_padding(self) -> tuple[int, int, int, int]:
+        """Card body inset — tight bottom so action row sits flush above the card edge."""
+        s = self._ui_scale
+        side = space(5, s)
+        return (side, side, side, space(2, s))
+
+    def _make_work_tab_card(self, parent: tk.Misc) -> tuple[tk.Frame, ttk.Frame, ttk.Frame, ttk.Frame]:
+        """Shared grey card shell: content row + action row (Document / Audiobook)."""
+        card = make_card(parent, self.colors)
+        card.pack(fill=tk.X)
+        body = ttk.Frame(card._card_inner, style="Card.TFrame", padding=self._work_tab_body_padding())  # type: ignore[attr-defined]
+        body.pack(fill=tk.X, anchor="nw")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=0)
+        body.rowconfigure(1, weight=0)
+        content = ttk.Frame(body, style="Card.TFrame")
+        content.grid(row=0, column=0, sticky="ew")
+        content.columnconfigure(0, weight=1)
+        action_row = ttk.Frame(body, style="Card.TFrame")
+        action_row.grid(row=1, column=0, sticky="ew", pady=(self._work_tab_action_gap(), 0))
+        action_row.columnconfigure(0, weight=1)
+        return card, body, content, action_row
+
+    def _player_tab_shell_pad(self) -> str:
+        """Player tab inset — tight top, minimal bottom."""
+        s = self._ui_scale
+        side = space(4, s)
+        return f"{side} {space(1, s)} {side} {space(2, s)}"
+
+    def _make_tab_outline(
+        self,
+        parent: ttk.Frame,
+        *,
+        expand: bool = False,
+        padding: str | int | tuple[int, ...] | None = None,
+    ) -> tuple[ttk.Frame, tk.Frame]:
+        """Rounded shell wrapping tab body (borderless — blends with page bg)."""
+        pad = padding if padding is not None else space(4, self._ui_scale)
+        shell = make_round_surface(
+            parent,
+            self.colors,
+            fill=self.colors["bg"],
+            page_bg=self.colors["bg"],
+            border=self.colors["bg"],
+            padding=0,
+        )
+        if expand:
+            shell.pack(fill=tk.BOTH, expand=True)
+            inner = ttk.Frame(shell._card_inner, padding=pad)  # type: ignore[attr-defined]
+            inner.pack(fill=tk.BOTH, expand=True)
+        else:
+            shell.pack(fill=tk.X, anchor="n")
+            inner = ttk.Frame(shell._card_inner, padding=pad)  # type: ignore[attr-defined]
+            inner.pack(fill=tk.X, anchor="n")
+        return inner, shell
+
+    # ---- footer progress bar (full-width) -----------------------------------
 
     def _build_footer(self, parent: ttk.Frame) -> None:
-        self._footer_container = tk.Frame(parent, bg=self.colors["surface"])
+        m = self._footer_metrics()
+        self._footer_container = tk.Frame(parent, bg="#0a0a0f")
         self._footer_container.pack(side=tk.BOTTOM, fill=tk.X)
-        self._footer_border = tk.Frame(self._footer_container, bg=self.colors["border"], height=1)
-        self._footer_border.pack(fill=tk.X)
-        self._footer_inner = tk.Frame(self._footer_container, bg=self.colors["surface"])
-        self._footer_inner.pack(fill=tk.X, padx=space(5, self._ui_scale), pady=space(2, self._ui_scale))
-        self._status_label = tk.Label(
-            self._footer_inner, textvariable=self.status_var,
-            bg=self.colors["surface"], fg=self.colors["muted"], anchor="w",
-        )
-        self._status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        track_font(self._status_label, "caption", self.colors)
+        self._footer_container.columnconfigure(0, weight=1)
 
-        self._footer_progress_frame = tk.Frame(self._footer_inner, bg=self.colors["surface"])
-        self._footer_progress_pct_var = tk.StringVar(value="0%")
-        self._footer_progress_pct = tk.Label(
-            self._footer_progress_frame, textvariable=self._footer_progress_pct_var,
-            bg=self.colors["surface"], fg=self.colors["muted"], anchor="e",
+        self._footer_canvas = tk.Canvas(
+            self._footer_container, height=m["height"], bg="#0a0a0f",
+            highlightthickness=0, bd=0,
         )
-        self._footer_progress_pct.pack(side=tk.LEFT, padx=(0, space(2, self._ui_scale)))
-        track_font(self._footer_progress_pct, "caption", self.colors)
-        bar_len = max(int(180 * self._ui_scale), 150)
-        self._footer_progress = ttk.Progressbar(
-            self._footer_progress_frame, variable=self.progress_var, maximum=100,
-            style="Accent.Horizontal.TProgressbar", mode="determinate", length=bar_len,
+        self._footer_canvas.grid(row=0, column=0, sticky="ew")
+        self._footer_canvas.bind("<Configure>", lambda _e: self._draw_footer_bar())
+
+        self.cancel_btn = make_ghost_button(
+            self._footer_container, "\u2715", self._cancel_convert, self.colors,
         )
-        self._footer_progress.pack(side=tk.LEFT, padx=(0, space(2, self._ui_scale)))
-        self.cancel_btn = make_secondary_button(
-            self._footer_progress_frame, "Cancel", self._cancel_convert, self.colors,
-        )
-        self.cancel_btn.pack(side=tk.LEFT)
+        self.cancel_btn.configure(bg="#0a0a0f")
+        self.cancel_btn.place(relx=1.0, rely=0.5, anchor="e", x=-m["btn_pad_x"])
         self.cancel_btn.configure(state=tk.DISABLED)
-        self._footer_progress_frame.pack(side=tk.RIGHT)
+        self.after_idle(self._sync_footer_title)
+
+    def _footer_title_font(self) -> tkfont.Font:
+        return tkfont.Font(font=typeface("label", self._ui_scale, weight="bold"))
+
+    def _footer_bar_colors(self) -> tuple[str, str, str]:
+        """Background, gradient start (purple), gradient end (dark purple)."""
+        c = self.colors
+        idle = "#0a0a0f"
+        purple = c["accent"]
+        purple_dark = "#2a1f4a"
+        style = getattr(self, "_footer_progress_style", "idle")
+        if style == "Danger.Horizontal.TProgressbar":
+            return ("#1a0a10", "#b83248", "#5a1830")
+        if style == "Success.Horizontal.TProgressbar":
+            return (idle, purple, purple_dark)
+        if self._busy or self._current_progress_pct > 0.01:
+            return (idle, purple, purple_dark)
+        return (idle, idle, purple_dark)
+
+    def _draw_footer_bar(self) -> None:
+        if not hasattr(self, "_footer_canvas"):
+            return
+        try:
+            canvas = self._footer_canvas
+            w = max(canvas.winfo_width(), 1)
+            h = max(canvas.winfo_height(), 1)
+            canvas.delete("all")
+            pct = self._current_progress_pct / 100.0
+            bg, mid, hi = self._footer_bar_colors()
+            r = corner_radius(self._ui_scale)
+            draw_round_rect_top(canvas, 0, 0, w, h, r, fill=bg, tags="bg")
+            fill_w = int(w * pct)
+            if fill_w > 0 and (self._busy or pct > 0.01):
+                steps = max(24, min(80, fill_w // 4))
+                for i in range(steps):
+                    x0 = int(i / steps * fill_w)
+                    x1 = int((i + 1) / steps * fill_w)
+                    if x1 <= x0:
+                        x1 = x0 + 1
+                    t = i / max(steps - 1, 1)
+                    color = self._lerp_color(mid, hi, t)
+                    canvas.create_rectangle(x0, 0, x1, h, fill=color, outline="", tags="fill")
+            canvas.create_text(
+                w / 2, h / 2,
+                text=self._footer_title_var.get(),
+                fill="#ffffff",
+                font=self._footer_title_font(),
+                tags="footer_title",
+            )
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _lerp_color(a: str, b: str, t: float) -> str:
+        def _hex(c: str) -> tuple[int, int, int]:
+            c = c.lstrip("#")
+            return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+        r0, g0, b0 = _hex(a)
+        r1, g1, b1 = _hex(b)
+        r = int(r0 + (r1 - r0) * t)
+        g = int(g0 + (g1 - g0) * t)
+        bl = int(b0 + (b1 - b0) * t)
+        return f"#{r:02x}{g:02x}{bl:02x}"
+
+    def _sync_footer_title(self) -> None:
+        src = self._normalize_path(self.source_var.get()) if self.source_var.get().strip() else None
+        name = Path(src).name if src else ""
+        pct = self._current_progress_pct
+        style = getattr(self, "_footer_progress_style", "idle")
+        show_pct = (
+            self._busy
+            or pct > 0.01
+            or style in ("Success.Horizontal.TProgressbar", "Danger.Horizontal.TProgressbar")
+        )
+        if show_pct and name:
+            self._footer_title_var.set(f"{name} — {pct:.0f}%")
+        elif show_pct:
+            self._footer_title_var.set(f"{pct:.0f}%")
+        elif name:
+            self._footer_title_var.set(name)
+        else:
+            self._footer_title_var.set("Ready — choose a PDF or markdown file to begin")
+        self._draw_footer_bar()
 
     # ---- activity log (inside Document / Audiobook outlines) ----------------
 
     def _build_activity_log_panel(self, parent: ttk.Frame) -> None:
         """One activity-log block per tab host (widgets cannot move across notebook tabs)."""
         if not hasattr(self, "_log_collapsed"):
-            self._log_collapsed = False
+            self._log_collapsed = True
             self._log_user_override: bool | None = None
         gap = space(3, self._ui_scale)
 
         head = ttk.Frame(parent)
         head.pack(fill=tk.X, pady=(gap, gap))
-        chevron = ttk.Label(head, text="▾", style="Heading.TLabel", cursor="hand2")
+        chevron = ttk.Label(head, text="▸", style="SubsectionHeading.TLabel", cursor="hand2")
         chevron.pack(side=tk.LEFT, padx=(0, space(1, self._ui_scale)))
-        log_title = ttk.Label(head, text="Activity log", style="Heading.TLabel", cursor="hand2")
-        log_title.pack(side=tk.LEFT)
+        log_title = self._make_subsection_heading(head, "Activity log", side=tk.LEFT)
+        log_title.configure(cursor="hand2")
         for w in (chevron, log_title):
             w.bind("<Button-1>", lambda _e: self._toggle_log())
         make_ghost_button(head, "Clear", self._clear_log, self.colors).pack(side=tk.RIGHT)
@@ -580,11 +953,21 @@ class NovelflowApp(tk.Tk):
         self._log_panels.append({"head": head, "card": card, "chevron": chevron, "text": text})
 
     def _sync_bottom_panel_for_tab(self) -> None:
-        """Footer progress on every tab."""
-        if not hasattr(self, "_footer_progress_frame"):
-            return
-        if not self._footer_progress_frame.winfo_ismapped():
-            self._footer_progress_frame.pack(side=tk.RIGHT)
+        """Footer progress is always visible on every tab."""
+        return
+
+    def _sync_progress_display(self) -> None:
+        pct = self._current_progress_pct
+        label = self._current_progress_label
+        eta = self._eta_text(pct) if self._progress_start is not None else ""
+        parts = [f"{pct:.0f}%"]
+        if label:
+            parts.append(label)
+        if eta:
+            parts.append(eta)
+        self.progress_meta_var.set("   ·   ".join(parts) if parts else "")
+        self._sync_footer_title()
+        self._draw_footer_bar()
 
     def _toggle_log(self) -> None:
         desired_collapsed = not self._log_collapsed
@@ -604,37 +987,81 @@ class NovelflowApp(tk.Tk):
                 panel["chevron"].configure(text="▾")
         self._sync_progress_display()
 
-    def _sync_progress_display(self) -> None:
-        """Show percentage and phase/status to the left of the progress bar."""
-        pct = self._current_progress_pct
-        label = self._current_progress_label
-        eta = self._eta_text(pct) if self._progress_start is not None else ""
-        parts = [f"{pct:.0f}%"]
-        if label:
-            parts.append(label)
-        if eta:
-            parts.append(eta)
-        self.progress_meta_var.set("   ·   ".join(parts) if parts else "")
-        self._footer_progress_pct_var.set(f"{pct:.0f}%")
-
     # ---- toast notifications ------------------------------------------------
 
     def _build_toast(self) -> None:
         self._toast_after: str | None = None
-        self._toast = tk.Frame(self, bg=self.colors["surface"], highlightthickness=1)
-        self._toast.configure(highlightbackground=self.colors["accent"], highlightcolor=self.colors["accent"])
-        inner = tk.Frame(self._toast, bg=self.colors["surface"])
-        inner.pack(fill=tk.BOTH, expand=True, padx=space(3, self._ui_scale), pady=space(2, self._ui_scale))
+        self._toast = make_round_surface(
+            self, self.colors, fill=self.colors["surface"], border=self.colors["border"],
+            padding=space(1, self._ui_scale),
+        )
+        inner = self._toast._card_inner  # type: ignore[attr-defined]
+        inner.pack_propagate(True)
+        pad = space(4, self._ui_scale)
+        body = tk.Frame(inner, bg=self.colors["surface"])
+        body.pack(fill=tk.BOTH, expand=True, padx=pad, pady=space(3, self._ui_scale))
+        self._toast_icon = tk.Label(
+            body, text="", bg=self.colors["surface"], fg=self.colors["accent"],
+            font=typeface("title", self._ui_scale),
+        )
+        self._toast_icon.pack(side=tk.LEFT, padx=(0, space(2, self._ui_scale)))
         self._toast_msg = tk.Label(
-            inner, text="", bg=self.colors["surface"], fg=self.colors["text"], anchor="w", justify="left",
+            body, text="", bg=self.colors["surface"], fg=self.colors["text"],
+            anchor="w", justify="left", wraplength=0,
         )
         self._toast_msg.pack(side=tk.LEFT, padx=(0, space(2, self._ui_scale)))
         track_font(self._toast_msg, "body", self.colors)
-        self._toast_actions = tk.Frame(inner, bg=self.colors["surface"])
+        self._toast_actions = tk.Frame(body, bg=self.colors["surface"])
         self._toast_actions.pack(side=tk.LEFT)
-        close = tk.Label(inner, text="✕", bg=self.colors["surface"], fg=self.colors["muted"], cursor="hand2")
+        close = make_ghost_button(body, "\u2715", self._hide_toast, self.colors)
+        close.configure(bg=self.colors["surface"])
         close.pack(side=tk.RIGHT, padx=(space(2, self._ui_scale), 0))
-        close.bind("<Button-1>", lambda _e: self._hide_toast())
+
+    def _toast_bottom_offset(self) -> int:
+        return self._footer_metrics()["height"] + space(8, self._ui_scale)
+
+    def _paint_toast_border(self, accent: str) -> None:
+        canvas = getattr(self._toast, "_card_canvas", None)
+        if canvas is None:
+            return
+        try:
+            w, h = max(canvas.winfo_width(), 1), max(canvas.winfo_height(), 1)
+            r = corner_radius(self._ui_scale)
+            canvas.delete("card_bg")
+            draw_round_rect(canvas, 2, 3, w, h + 2, r, fill="#050508", tags="card_bg")
+            draw_round_rect(canvas, 0, 0, w - 2, h, r, fill=accent, tags="card_bg")
+            draw_round_rect(
+                canvas, 1, 1, w - 3, h - 1, max(1, r - 1),
+                fill=self.colors["surface"], tags="card_bg",
+            )
+            canvas.tag_lower("card_bg")
+        except tk.TclError:
+            pass
+
+    def _fit_toast_size(self) -> None:
+        """Size toast to fit message on one line (no wrapping)."""
+        canvas = getattr(self._toast, "_card_canvas", None)
+        inner = getattr(self._toast, "_card_inner", None)
+        if canvas is None or inner is None:
+            return
+        try:
+            for item in canvas.find_all():
+                if canvas.type(item) == "window":
+                    canvas.itemconfigure(item, width=0)
+                    break
+            inner.update_idletasks()
+            r = corner_radius(self._ui_scale)
+            inset = 2 * (r + 1)
+            margin = space(8, self._ui_scale)
+            req_w = inner.winfo_reqwidth() + inset
+            req_h = inner.winfo_reqheight() + inset
+            max_w = max(self.winfo_width() - 2 * margin, req_w)
+            toast_w = min(req_w, max_w)
+            toast_h = max(req_h, 4)
+            canvas.configure(width=toast_w, height=toast_h)
+            canvas.event_generate("<Configure>")
+        except tk.TclError:
+            pass
 
     def _show_toast(
         self, message: str, *, kind: str = "info", actions: list[tuple] | None = None, duration_ms: int = 6500,
@@ -642,15 +1069,18 @@ class NovelflowApp(tk.Tk):
         accent = {"error": self.colors.get("danger", "#ef4444"),
                   "warn": self.colors.get("glow", self.colors["accent"]),
                   "success": self.colors["accent"]}.get(kind, self.colors["accent"])
-        self._toast.configure(highlightbackground=accent, highlightcolor=accent)
-        self._toast_msg.configure(text=message)
+        icon = {"error": "\u2716", "warn": "\u26a0", "success": "\u2714"}.get(kind, "\u2139")
+        self._toast_icon.configure(text=icon, fg=accent)
+        self._toast_msg.configure(text=message, wraplength=0)
         for child in self._toast_actions.winfo_children():
             child.destroy()
         for label, callback in (actions or []):
-            make_ghost_button(self._toast_actions, label, callback, self.colors).pack(
-                side=tk.LEFT, padx=(0, space(1, self._ui_scale)),
-            )
-        self._toast.place(relx=0.5, rely=1.0, anchor="s", y=-space(6, self._ui_scale))
+            action_btn = make_ghost_button(self._toast_actions, label, callback, self.colors)
+            action_btn.configure(bg=self.colors["surface"])
+            action_btn.pack(side=tk.LEFT, padx=(0, space(1, self._ui_scale)))
+        self._fit_toast_size()
+        self._paint_toast_border(accent)
+        self._toast.place(relx=0.5, rely=1.0, anchor="s", y=-self._toast_bottom_offset())
         self._toast.lift()
         if self._toast_after is not None:
             self.after_cancel(self._toast_after)
@@ -671,11 +1101,14 @@ class NovelflowApp(tk.Tk):
 
     def _build_drop_overlay(self) -> None:
         self._drop_overlay = tk.Frame(self, bg=self.colors["hero_bg"])
-        box = tk.Frame(self._drop_overlay, bg=self.colors["surface"], highlightthickness=2)
-        box.configure(highlightbackground=self.colors["accent"], highlightcolor=self.colors["accent"])
+        box = make_round_surface(
+            self._drop_overlay, self.colors,
+            fill=self.colors["surface"], border=self.colors["accent"],
+        )
         box.place(relx=0.5, rely=0.5, anchor="center")
+        inner = box._card_inner  # type: ignore[attr-defined]
         msg = tk.Label(
-            box, text="Drop your PDF or markdown here", bg=self.colors["surface"], fg=self.colors["text"],
+            inner, text="Drop your PDF or markdown here", bg=self.colors["surface"], fg=self.colors["text"],
             padx=space(8, self._ui_scale), pady=space(6, self._ui_scale),
         )
         msg.pack()
@@ -709,37 +1142,115 @@ class NovelflowApp(tk.Tk):
     def _build_document_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
-        inner, self._doc_outline_shell = self._make_tab_outline(parent, expand=True)
+        inner, self._doc_outline_shell = self._make_tab_outline(
+            parent, expand=True, padding=self._work_tab_shell_pad(),
+        )
         inner.columnconfigure(0, weight=1)
         inner.rowconfigure(1, weight=1)
         top = ttk.Frame(inner)
-        top.grid(row=0, column=0, sticky="ew")
-        ttk.Label(top, text="Source document", style="Heading.TLabel").pack(anchor="w")
+        top.grid(row=0, column=0, sticky="new")
+        top.columnconfigure(0, weight=1)
+        self._doc_work_top = top
+        self._make_section_heading(top, "Source document").pack(anchor="w")
         ttk.Label(
             top,
             text="Drop or choose a PDF (or an existing .md). PDFs are converted to clean markdown.",
             style="Muted.TLabel",
-        ).pack(anchor="w", pady=(space(1, self._ui_scale), space(3, self._ui_scale)))
+        ).pack(anchor="w", pady=self._work_tab_subtitle_pady())
 
-        card = make_card(top, self.colors)
-        card.pack(fill=tk.X)
-        body = ttk.Frame(card._card_inner, style="Card.TFrame", padding=space(5, self._ui_scale))  # type: ignore[attr-defined]
-        body.pack(fill=tk.X)
-        body.columnconfigure(1, weight=1)
+        card, body, content, action_row = self._make_work_tab_card(top)
+        self._doc_card = card
+        self._doc_card_body = body
+        self._doc_work_content = content
+        self._doc_action_row = action_row
 
-        self.source_entry = self._field_row(body, 0, "Source", self.source_var, self._browse_source)
-        self.output_entry = self._field_row(body, 1, "Markdown out", self.output_var, self._browse_output)
-        self._register_drop_target(self.source_entry)
+        self._doc_drop_host = ttk.Frame(content, style="Card.TFrame")
+        self._doc_drop_host.grid(row=0, column=0, sticky="ew")
+        self._doc_drop_host.columnconfigure(0, weight=1)
 
-        opts = ttk.Frame(body, style="Card.TFrame")
-        opts.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(space(3, self._ui_scale), space(2, self._ui_scale)))
-        ttk.Checkbutton(
-            opts, text="Save raw extracted text (.raw.md)",
-            variable=self.keep_raw_var, style="Card.TCheckbutton", takefocus=0,
-        ).pack(anchor="w")
+        drop_shell = make_round_surface(
+            self._doc_drop_host,
+            self.colors,
+            fill=self.colors["surface"],
+            page_bg=self.colors["card"],
+            border=self.colors["border"],
+        )
+        self._doc_drop_shell = drop_shell
+        drop_shell.pack(fill=tk.X)
+        self._doc_drop_canvas = drop_shell._card_canvas  # type: ignore[attr-defined]
+        drop_inner = drop_shell._card_inner  # type: ignore[attr-defined]
+        drop_inner.columnconfigure(0, weight=1)
+        drop_inner.rowconfigure(0, weight=1)
 
-        bar = self._track_reflow_bar(ReflowBar(body, gap=space(2, self._ui_scale), style="Card.TFrame"))
-        bar.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(space(3, self._ui_scale), 0))
+        self._doc_empty_view = ttk.Frame(drop_inner, style="Card.TFrame")
+        self._doc_empty_view.grid(row=0, column=0, sticky="nsew")
+        self._doc_empty_view.columnconfigure(0, weight=1)
+        self._doc_empty_view.rowconfigure(0, weight=1)
+        self._doc_empty_view.rowconfigure(1, weight=0)
+        self._doc_empty_view.rowconfigure(2, weight=1)
+        empty_pad = space(3, self._ui_scale)
+        empty_content = ttk.Frame(self._doc_empty_view, style="Card.TFrame", padding=(empty_pad, empty_pad))
+        empty_content.grid(row=1, column=0)
+        self._doc_empty_content = empty_content
+        empty_content.columnconfigure(0, weight=1)
+        arrow_font = tkfont.Font(family="Segoe UI", size=max(28, int(36 * self._ui_scale)))
+        tk.Label(
+            empty_content, text="\u2193", bg=self.colors["card"], fg=self.colors["muted"],
+            font=arrow_font,
+        ).pack(pady=(0, space(2, self._ui_scale)))
+        ttk.Label(
+            empty_content, text="Drop PDF or markdown here", style="CardFormLabel.TLabel", anchor="center",
+        ).pack(fill=tk.X, pady=(0, space(2, self._ui_scale)))
+        make_secondary_button(empty_content, "Choose file\u2026", self._browse_source, self.colors).pack(
+            pady=(0, space(1, self._ui_scale)),
+        )
+        ttk.Label(empty_content, text="PDF \u00b7 Markdown (.md)", style="CardMuted.TLabel", anchor="center").pack(
+            fill=tk.X,
+        )
+        self._register_drop_target(drop_inner)
+        self._register_drop_target(self._doc_empty_view)
+
+        self._doc_selected_view = ttk.Frame(drop_inner, style="Card.TFrame")
+        self._doc_selected_view.grid(row=0, column=0, sticky="nsew")
+        self._doc_selected_view.columnconfigure(0, weight=1)
+        self._doc_selected_view.rowconfigure(0, weight=1)
+        self._doc_selected_view.rowconfigure(1, weight=0)
+        self._doc_selected_view.rowconfigure(2, weight=1)
+        sel_pad = space(4, self._ui_scale)
+        sel_content = ttk.Frame(self._doc_selected_view, style="Card.TFrame", padding=(sel_pad, sel_pad))
+        sel_content.grid(row=1, column=0)
+        self._doc_selected_content = sel_content
+        sel_content.columnconfigure(0, weight=1)
+        self._doc_filename_var = tk.StringVar()
+        self._doc_path_var = tk.StringVar()
+        ttk.Label(
+            sel_content, textvariable=self._doc_filename_var, style="SectionHeading.TLabel", anchor="center",
+        ).grid(row=0, column=0, sticky="ew")
+        self._doc_path_label = ttk.Label(
+            sel_content, textvariable=self._doc_path_var, style="CardMuted.TLabel", anchor="center",
+        )
+        self._doc_path_label.grid(
+            row=1, column=0, sticky="ew", pady=(space(1, self._ui_scale), space(2, self._ui_scale)),
+        )
+        sel_actions_outer = ttk.Frame(sel_content, style="Card.TFrame")
+        sel_actions_outer.grid(row=2, column=0, sticky="ew")
+        sel_actions_outer.columnconfigure(0, weight=1)
+        sel_actions_outer.columnconfigure(1, weight=0)
+        sel_actions_outer.columnconfigure(2, weight=1)
+        sel_actions = ttk.Frame(sel_actions_outer, style="Card.TFrame")
+        sel_actions.grid(row=0, column=1)
+        act_gap = space(2, self._ui_scale)
+        make_secondary_button(sel_actions, "Change file", self._browse_source, self.colors).pack(
+            side=tk.LEFT, padx=(0, act_gap),
+        )
+        make_ghost_button(sel_actions, "Clear", self._clear_source_path, self.colors).pack(side=tk.LEFT)
+        self._register_drop_target(self._doc_selected_view)
+
+        self._doc_adv_popup_open = False
+        self.output_entry: tk.Entry | None = None
+
+        bar = self._track_reflow_bar(ReflowBar(action_row, gap=space(2, self._ui_scale), style="Card.TFrame"))
+        bar.grid(row=0, column=0, sticky="w")
         self.convert_btn = make_accent_button(bar, "Convert to markdown", self._start_convert, self.colors)
         bar.add(self.convert_btn)
         self.open_btn = make_secondary_button(bar, "Open folder", self._open_output_folder, self.colors)
@@ -748,41 +1259,431 @@ class NovelflowApp(tk.Tk):
         bar.add(self.open_file_btn)
         self.open_btn.configure(state=tk.DISABLED)
         self.open_file_btn.configure(state=tk.DISABLED)
-
-        tip = ttk.Label(
-            top,
-            text="Tip: to make an audiobook directly, switch to the Audiobook tab — it converts the PDF for you if needed.",
-            style="Muted.TLabel",
+        self._doc_adv_btn = make_compact_dropdown(
+            action_row, "Advanced", self._toggle_doc_advanced_popup, self.colors,
         )
-        tip.pack(anchor="w", pady=(space(3, self._ui_scale), 0))
+        self._doc_adv_btn.grid(row=0, column=1, sticky="e", padx=(space(3, self._ui_scale), 0))
+        self.bind("<Button-1>", self._on_doc_adv_dismiss, add="+")
+        bar.reflow()
 
         self._doc_log_host = ttk.Frame(inner)
         self._doc_log_host.grid(row=1, column=0, sticky="nsew")
+
+        self._sync_document_source_view()
+        self._sync_drop_zone_height(force=True)
+        self.after_idle(self._sync_work_tab_heights)
+
+    def _ensure_doc_advanced_popup(self) -> tk.Toplevel:
+        if self._doc_advanced_popup is not None:
+            try:
+                if self._doc_advanced_popup.winfo_exists():
+                    return self._doc_advanced_popup
+            except tk.TclError:
+                pass
+        pop = tk.Toplevel(self)
+        pop.withdraw()
+        pop.overrideredirect(True)
+        pop.configure(bg=self.colors["border"])
+        shell = make_round_surface(
+            pop,
+            self.colors,
+            fill=self.colors["card"],
+            page_bg=self.colors["border"],
+            border=self.colors["border"],
+            padding=space(4, self._ui_scale),
+        )
+        shell.pack()
+        self._doc_adv_popup_shell = shell
+        form = tk.Frame(shell._card_inner, bg=self.colors["card"])  # type: ignore[attr-defined]
+        form.pack()
+        self.output_entry = self._field_row(
+            form, 0, "Markdown out", self.output_var, self._browse_output, on_card=True,
+        )
+        self._blend_path_entry(self.output_entry)
+        opts = tk.Frame(form, bg=self.colors["card"])
+        opts.grid(row=1, column=0, columnspan=3, sticky="w", pady=(space(2, self._ui_scale), 0))
+        ttk.Checkbutton(
+            opts, text="Save raw extracted text (.raw.md)",
+            variable=self.keep_raw_var, style="Card.TCheckbutton", takefocus=0,
+        ).pack(anchor="w")
+        pop.bind("<Escape>", lambda _e: self._close_doc_advanced_popup())
+        self._doc_advanced_popup = pop
+        return pop
+
+    @staticmethod
+    def _widget_at_root(widget: tk.Misc, rx: int, ry: int) -> bool:
+        try:
+            wx = widget.winfo_rootx()
+            wy = widget.winfo_rooty()
+            return wx <= rx <= wx + widget.winfo_width() and wy <= ry <= wy + widget.winfo_height()
+        except tk.TclError:
+            return False
+
+    def _is_doc_adv_popup_descendant(self, widget: tk.Misc) -> bool:
+        pop = self._doc_advanced_popup
+        if pop is None:
+            return False
+        w: tk.Misc | None = widget
+        while w is not None:
+            if w == pop:
+                return True
+            w = w.master
+        return False
+
+    def _on_doc_adv_dismiss(self, event) -> None:
+        if not self._doc_adv_popup_open or getattr(self, "_doc_adv_ignore_dismiss", False):
+            return
+        if self._is_doc_adv_popup_descendant(event.widget):
+            return
+        if self._widget_at_root(self._doc_adv_btn, event.x_root, event.y_root):
+            return
+        self._close_doc_advanced_popup()
+
+    def _toggle_doc_advanced_popup(self) -> None:
+        if self._doc_adv_popup_open:
+            self._close_doc_advanced_popup()
+            return
+        pop = self._ensure_doc_advanced_popup()
+        self.update_idletasks()
+        btn = self._doc_adv_btn
+        shell = self._doc_adv_popup_shell
+        shell.update_idletasks()
+        w = shell.winfo_reqwidth()
+        h = shell.winfo_reqheight()
+        x = btn.winfo_rootx() + btn.winfo_width() - w
+        y = btn.winfo_rooty() + btn.winfo_height() + space(1, self._ui_scale)
+        pop.geometry(f"{w}x{h}+{x}+{y}")
+        pop.deiconify()
+        pop.lift()
+        self._doc_adv_popup_open = True
+        self._doc_adv_ignore_dismiss = True
+        self.after(120, lambda: setattr(self, "_doc_adv_ignore_dismiss", False))
+
+    def _close_doc_advanced_popup(self) -> None:
+        if self._doc_advanced_popup is not None:
+            try:
+                self._doc_advanced_popup.withdraw()
+            except tk.TclError:
+                pass
+        self._doc_adv_popup_open = False
+
+    def _sync_output_entry(self, value: str) -> None:
+        if self.output_entry is not None:
+            self._sync_entry(self.output_entry, value)
+
+    @staticmethod
+    def _truncate_path(path: str, max_len: int = 72) -> str:
+        if len(path) <= max_len:
+            return path
+        head = max_len // 2 - 2
+        tail = max_len - head - 1
+        return f"{path[:head]}\u2026{path[-tail:]}"
+
+    def _sync_document_source_view(self) -> None:
+        if not hasattr(self, "_doc_empty_view"):
+            return
+        path = self._normalize_path(self.source_var.get())
+        if path:
+            src = Path(path)
+            self._doc_filename_var.set(src.name)
+            self._doc_path_var.set(self._truncate_path(path))
+            self._doc_empty_view.grid_remove()
+            self._doc_selected_view.grid()
+        else:
+            self._doc_filename_var.set("")
+            self._doc_path_var.set("")
+            self._doc_selected_view.grid_remove()
+            self._doc_empty_view.grid()
+
+    def _clear_source_path(self) -> None:
+        self.source_var.set("")
+        self.output_var.set("")
+        if hasattr(self, "output_entry") and self.output_entry is not None:
+            self._sync_output_entry("")
+        self._sync_workflow_from_inputs()
+        self.status_var.set("Ready — choose a PDF or markdown file to begin")
+
+    # ---- cross-tab workflow sync --------------------------------------------
+
+    def _schedule_workflow_sync(self) -> None:
+        if self._workflow_sync_after is not None:
+            try:
+                self.after_cancel(self._workflow_sync_after)
+            except tk.TclError:
+                pass
+        self._workflow_sync_after = self.after(150, self._run_scheduled_workflow_sync)
+
+    def _run_scheduled_workflow_sync(self) -> None:
+        self._workflow_sync_after = None
+        self._sync_workflow_from_inputs()
+
+    def _current_markdown_path(self) -> Path | None:
+        source = self._normalize_path(self.source_var.get())
+        if not source:
+            return None
+        src = Path(source)
+        if src.suffix.lower() == ".md":
+            return src
+        output_raw = self.output_var.get().strip()
+        if output_raw:
+            return Path(self._normalize_path(output_raw))
+        return self._markdown_target(src)
+
+    @staticmethod
+    def _audiobook_label_for_markdown(md: Path) -> str:
+        return md.stem
+
+    @staticmethod
+    def _markdown_audiobook_aliases(md: Path) -> set[str]:
+        stem = md.stem
+        aliases = {stem, stem.lower()}
+        if stem.endswith(".readable"):
+            short = stem[: -len(".readable")]
+            aliases.update({short, short.lower()})
+        return aliases
+
+    def _card_settings_divider(self, parent: tk.Misc, row: int, *, colspan: int = 2) -> None:
+        tk.Frame(parent, bg=self.colors["border"], height=1).grid(
+            row=row, column=0, columnspan=colspan, sticky="ew",
+        )
+
+    def _expected_audiobook_path(self) -> Path | None:
+        md = self._current_markdown_path()
+        if md is None:
+            return None
+        fmt = self.audio_format_var.get().strip() or "m4b"
+        return self._audiobook_output_path(md, fmt)
+
+    def _clear_sections_state(self, *, message: str = "Load a document to see an estimate.") -> None:
+        self._clear_section_checkboxes()
+        self.section_count_var.set("")
+        self.estimate_var.set(message)
+
+    def _sync_audiobook_action_buttons(self) -> None:
+        lib_path = self._selected_library_audiobook()
+        has_audiobook = bool(
+            (self._last_audiobook is not None and Path(self._last_audiobook).exists())
+            or lib_path is not None
+        )
+        if hasattr(self, "audio_open_btn"):
+            self.audio_open_btn.configure(state=tk.NORMAL if has_audiobook else tk.DISABLED)
+        if hasattr(self, "audio_play_btn"):
+            self.audio_play_btn.configure(state=tk.NORMAL if has_audiobook else tk.DISABLED)
+        if hasattr(self, "audiobook_lib_open_btn"):
+            self.audiobook_lib_open_btn.configure(
+                state=tk.NORMAL if lib_path is not None else tk.DISABLED,
+            )
+
+    def _select_library_audiobook_for_markdown(self, md: Path) -> None:
+        if not hasattr(self, "audiobook_lib_combo"):
+            return
+        label = self._audiobook_label_for_markdown(md)
+        labels = [entry[0] for entry in self._audiobook_lib_entries]
+        aliases = self._markdown_audiobook_aliases(md)
+        pick = label if label in labels else ""
+        if not pick:
+            for lib_label in labels:
+                if lib_label in aliases or lib_label.lower() in aliases:
+                    pick = lib_label
+                    break
+        expected = self._expected_audiobook_path()
+        if expected is not None:
+            for lib_label, lib_path in self._audiobook_lib_entries:
+                if lib_path.resolve() == expected.resolve():
+                    pick = lib_label
+                    break
+                sidecar = expected.with_name(f"{expected.stem}.chapters.json")
+                if lib_path.resolve() == sidecar.resolve():
+                    pick = lib_label
+                    break
+        if pick:
+            self.audiobook_lib_pick_var.set(pick)
+        elif self.audiobook_lib_pick_var.get() not in labels:
+            self.audiobook_lib_pick_var.set("")
+        lib_path = self._selected_library_audiobook()
+        if lib_path is not None:
+            self._last_audiobook = lib_path
+        elif expected is not None and expected.is_file():
+            self._last_audiobook = expected
+        self._sync_audiobook_action_buttons()
+
+    def _sync_player_document_label(self) -> None:
+        if not hasattr(self, "player_title_var"):
+            return
+        md = self._current_markdown_path()
+        if md is None:
+            if self._player_path is None:
+                self.player_title_var.set("No audiobook loaded yet")
+            return
+        expected = self._expected_audiobook_path()
+        expected_name = expected.name if expected else None
+        if self._player_path is not None and self._player_playable:
+            loaded = self._player_path.resolve()
+            matches = expected is not None and loaded == expected.resolve()
+            if not matches:
+                for lib_label, lib_path in self._audiobook_lib_entries:
+                    if lib_label == self._audiobook_label_for_markdown(md) and lib_path.resolve() == loaded:
+                        matches = True
+                        break
+            if matches:
+                chapters = len(self._player_chapters)
+                self.player_title_var.set(f"Loaded: {self._player_path.name}  ·  {chapters} chapter(s)")
+                return
+            self.player_title_var.set(
+                f"Playing {self._player_path.name} — document is now {md.name}",
+            )
+            return
+        lib_path = self._selected_library_audiobook()
+        if lib_path is not None:
+            self.player_title_var.set(f"{lib_path.name} selected for {md.name}")
+            return
+        if expected is not None and expected.is_file():
+            self.player_title_var.set(f"{expected.name} ready for {md.name}")
+        elif expected_name:
+            self.player_title_var.set(f"No {expected_name} yet for {md.name}")
+        else:
+            self.player_title_var.set(f"Document: {md.name}")
+
+    def _sync_workflow_from_inputs(self) -> None:
+        if not hasattr(self, "_doc_empty_view"):
+            return
+        md = self._current_markdown_path()
+        if md is not None and md.is_file():
+            self._load_sections_from_markdown(md)
+        elif not self.source_var.get().strip():
+            self._clear_sections_state()
+        else:
+            self._clear_sections_state(
+                message="Convert to markdown or choose an existing .md to see sections.",
+            )
+
+        if md is not None:
+            folder = str(md.parent)
+            if self._normalize_path(self.audiobook_lib_dir_var.get()) != folder:
+                self._set_audiobook_library_folder(folder)
+            else:
+                self._refresh_audiobook_library()
+            self._select_library_audiobook_for_markdown(md)
+        elif hasattr(self, "audiobook_lib_combo"):
+            self._refresh_audiobook_library()
+            self._last_audiobook = None
+            self._sync_audiobook_action_buttons()
+
+        self._sync_player_document_label()
+        self._sync_document_source_view()
+        self._sync_footer_title()
 
     # ---- Audiobook tab ------------------------------------------------------
 
     def _build_audiobook_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
-        inner, self._audio_outline_shell = self._make_tab_outline(parent, expand=True)
+        inner, self._audio_outline_shell = self._make_tab_outline(
+            parent, expand=True, padding=self._work_tab_shell_pad(),
+        )
         self._audiobook_tab_page = parent
         inner.columnconfigure(0, weight=1)
         inner.rowconfigure(1, weight=1)
         top = ttk.Frame(inner)
-        top.grid(row=0, column=0, sticky="ew")
-        ttk.Label(top, text="Audiobook", style="Heading.TLabel").pack(anchor="w")
+        top.grid(row=0, column=0, sticky="new")
+        top.columnconfigure(0, weight=1)
+        self._audio_work_top = top
+        self._make_section_heading(top, "Audiobook").pack(anchor="w")
         ttk.Label(
             top,
             text="Pick a voice, format, and sections, then create the audiobook. Works from a PDF or an existing .md.",
             style="Muted.TLabel",
-        ).pack(anchor="w", pady=(space(1, self._ui_scale), space(3, self._ui_scale)))
+        ).pack(anchor="w", pady=self._work_tab_subtitle_pady())
 
-        action_card = make_card(top, self.colors)
-        action_card.pack(fill=tk.X, pady=(0, space(3, self._ui_scale)))
-        action_body = ttk.Frame(action_card._card_inner, style="Card.TFrame", padding=space(4, self._ui_scale))  # type: ignore[attr-defined]
-        action_body.pack(fill=tk.X)
-        bar = self._track_reflow_bar(ReflowBar(action_body, gap=space(2, self._ui_scale), style="Card.TFrame"))
-        bar.pack(fill=tk.X)
+        card, body, content, action_row = self._make_work_tab_card(top)
+        self._audio_card = card
+        self._audio_card_body = body
+        self._audio_work_content = content
+        self._audio_action_row = action_row
+
+        settings = ttk.Frame(content, style="Card.TFrame")
+        settings.grid(row=0, column=0, sticky="ew")
+        self._audio_settings_body = settings
+        settings.columnconfigure(0, weight=0)
+        settings.columnconfigure(1, weight=1)
+        label_w = 12
+        row_gap = space(3, self._ui_scale)
+        value_pad_x = space(3, self._ui_scale)
+        row_pady = (row_gap, row_gap)
+        grid_row = 0
+
+        ttk.Label(settings, text="Voice", style="CardFormLabel.TLabel", width=label_w).grid(
+            row=grid_row, column=0, sticky="w", pady=row_pady,
+        )
+        voice_row = ttk.Frame(settings, style="Card.TFrame")
+        voice_row.grid(row=grid_row, column=1, sticky="w", padx=(value_pad_x, 0), pady=row_pady)
+        voice_gap = space(2, self._ui_scale)
+        self.voice_combo = ttk.Combobox(voice_row, textvariable=self.tts_voice_var, state="readonly", style="Dark.TCombobox")
+        self.voice_combo.pack(side=tk.LEFT)
+        configure_dark_combobox(self.voice_combo, self.colors)
+        self.preview_btn = make_secondary_button(voice_row, "\u25b6 Preview", self._preview_voice, self.colors)
+        self.preview_btn.pack(side=tk.LEFT, padx=(voice_gap, 0))
+        grid_row += 1
+        self._card_settings_divider(settings, grid_row)
+        grid_row += 1
+
+        ttk.Label(settings, text="Format", style="CardFormLabel.TLabel", width=label_w).grid(
+            row=grid_row, column=0, sticky="w", pady=row_pady,
+        )
+        self.format_combo = ttk.Combobox(
+            settings, textvariable=self.audio_format_var, state="readonly", style="Dark.TCombobox",
+            values=("m4b", "mp3", "m4a"),
+        )
+        self.format_combo.grid(row=grid_row, column=1, sticky="w", padx=(value_pad_x, 0), pady=row_pady)
+        configure_dark_combobox(self.format_combo, self.colors)
+        fit_combobox(
+            self.format_combo, ("m4b", "mp3", "m4a"), scale=self._ui_scale, min_chars=6, max_chars=8,
+        )
+        grid_row += 1
+        self._card_settings_divider(settings, grid_row)
+        grid_row += 1
+
+        ttk.Label(settings, text="Estimate", style="CardFormLabel.TLabel", width=label_w).grid(
+            row=grid_row, column=0, sticky="w", pady=row_pady,
+        )
+        ttk.Label(settings, textvariable=self.estimate_var, style="CardMuted.TLabel").grid(
+            row=grid_row, column=1, sticky="w", padx=(value_pad_x, 0), pady=row_pady,
+        )
+        grid_row += 1
+        self._card_settings_divider(settings, grid_row)
+        grid_row += 1
+
+        sections_label = ttk.Frame(settings, style="Card.TFrame")
+        sections_label.grid(row=grid_row, column=0, sticky="w", pady=row_pady)
+        ttk.Label(sections_label, text="Sections", style="CardFormLabel.TLabel", width=label_w).pack(side=tk.LEFT)
+        ttk.Label(sections_label, textvariable=self.section_count_var, style="CardMuted.TLabel").pack(
+            side=tk.LEFT, padx=(space(1, self._ui_scale), 0),
+        )
+
+        sec_tools = ttk.Frame(settings, style="Card.TFrame")
+        sec_tools.grid(row=grid_row, column=1, sticky="w", padx=(value_pad_x, 0), pady=row_pady)
+        gap = space(2, self._ui_scale)
+        self._make_icon_button(
+            sec_tools, "↻", self._refresh_sections, title="Refresh sections", bg=self.colors["card"],
+        ).pack(side=tk.LEFT, padx=(0, gap))
+        ttk.Label(sec_tools, text="Preset", style="CardMuted.TLabel").pack(side=tk.LEFT, padx=(0, space(1, self._ui_scale)))
+        self.section_preset_combo = ttk.Combobox(
+            sec_tools, textvariable=self.section_preset_var, state="readonly",
+            style="Dark.TCombobox", values=_SECTION_PRESETS,
+        )
+        self.section_preset_combo.pack(side=tk.LEFT, padx=(0, gap))
+        configure_dark_combobox(self.section_preset_combo, self.colors)
+        fit_combobox(
+            self.section_preset_combo, _SECTION_PRESETS, scale=self._ui_scale, min_chars=14, max_chars=22,
+        )
+        self.section_preset_combo.bind("<<ComboboxSelected>>", self._on_section_preset_pick)
+        make_secondary_button(sec_tools, "Select sections", self._open_sections_picker, self.colors).pack(
+            side=tk.LEFT,
+        )
+
+        bar = self._track_reflow_bar(ReflowBar(action_row, gap=space(2, self._ui_scale), style="Card.TFrame"))
+        self._audio_action_bar = bar
+        bar.grid(row=0, column=0, sticky="w")
         self.make_audiobook_btn = make_accent_button(bar, "Create audiobook", self._start_audiobook, self.colors)
         bar.add(self.make_audiobook_btn)
         self.audio_open_btn = make_secondary_button(bar, "Open audiobook", self._open_audiobook_file, self.colors)
@@ -791,86 +1692,11 @@ class NovelflowApp(tk.Tk):
         bar.add(self.audio_play_btn)
         self.audio_open_btn.configure(state=tk.DISABLED)
         self.audio_play_btn.configure(state=tk.DISABLED)
-
-        engine_card = make_card(top, self.colors)
-        engine_card.pack(fill=tk.X, pady=(0, space(3, self._ui_scale)))
-        form = ttk.Frame(engine_card._card_inner, style="Card.TFrame", padding=space(4, self._ui_scale))  # type: ignore[attr-defined]
-        form.pack(fill=tk.X)
-        form.columnconfigure(1, weight=1)
-        label_w = 12
-        row_gap = space(3, self._ui_scale)
-
-        ttk.Label(form, text="Voice", style="CardFormLabel.TLabel", width=label_w).grid(
-            row=0, column=0, sticky="nw", pady=(0, row_gap),
-        )
-        voice_row = ttk.Frame(form, style="Card.TFrame")
-        voice_row.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, row_gap))
-        voice_row.columnconfigure(0, weight=1)
-        self.voice_combo = ttk.Combobox(voice_row, textvariable=self.tts_voice_var, state="readonly", style="Dark.TCombobox")
-        self.voice_combo.grid(row=0, column=0, sticky="ew")
-        configure_dark_combobox(self.voice_combo, self.colors)
-        self.preview_btn = make_secondary_button(voice_row, "\u25b6 Preview", self._preview_voice, self.colors)
-        self.preview_btn.grid(row=0, column=1, padx=(space(2, self._ui_scale), 0), sticky="w")
-
-        self._voice_stacked: bool | None = None
-
-        def _voice_reflow(_event=None) -> None:
-            w = voice_row.winfo_width()
-            if w <= 1:
-                return
-            stacked = w < 420
-            if stacked == self._voice_stacked:
-                return  # no change — avoid re-gridding (prevents <Configure> recursion)
-            self._voice_stacked = stacked
-            if stacked:
-                self.voice_combo.grid(row=0, column=0, columnspan=2, sticky="ew")
-                self.preview_btn.grid(row=1, column=0, sticky="w", pady=(space(1, self._ui_scale), 0))
-            else:
-                self.voice_combo.grid(row=0, column=0, sticky="ew")
-                self.preview_btn.grid(row=0, column=1, padx=(space(2, self._ui_scale), 0), sticky="w")
-
-        voice_row.bind("<Configure>", _voice_reflow)
-
-        ttk.Label(form, text="Format", style="CardFormLabel.TLabel", width=label_w).grid(row=1, column=0, sticky="w")
-        self.format_combo = ttk.Combobox(
-            form, textvariable=self.audio_format_var, state="readonly", width=10, style="Dark.TCombobox",
-            values=("m4b", "mp3", "m4a"),
-        )
-        self.format_combo.grid(row=1, column=1, sticky="w")
-        configure_dark_combobox(self.format_combo, self.colors)
-
-        est_body = self._inline_chip(top, "Estimate")
-        ttk.Label(est_body, textvariable=self.estimate_var, style="Muted.TLabel").pack(
-            side=tk.LEFT, padx=(space(1, self._ui_scale), 0),
-        )
-
-        sec_header = ttk.Frame(top)
-        sec_header.pack(fill=tk.X, pady=(space(2, self._ui_scale), 0))
-        ttk.Label(sec_header, text="Sections", style="Heading.TLabel").pack(side=tk.LEFT)
-        ttk.Label(sec_header, textvariable=self.section_count_var, style="Muted.TLabel").pack(
-            side=tk.LEFT, padx=(space(2, self._ui_scale), 0),
-        )
-
-        sec_tools = ttk.Frame(top)
-        sec_tools.pack(anchor="w", pady=(space(2, self._ui_scale), 0))
-        self._make_icon_button(sec_tools, "↻", self._refresh_sections, title="Refresh sections").pack(
-            side=tk.LEFT, padx=(0, space(2, self._ui_scale)),
-        )
-        preset_body = self._inline_chip(sec_tools, "Preset", pack=False)
-        preset_body._chip_outer.pack(side=tk.LEFT, padx=(0, space(2, self._ui_scale)))  # type: ignore[attr-defined]
-        self.section_preset_combo = ttk.Combobox(
-            preset_body, textvariable=self.section_preset_var, state="readonly", width=14,
-            style="Dark.TCombobox", values=_SECTION_PRESETS,
-        )
-        self.section_preset_combo.pack(side=tk.LEFT)
-        configure_dark_combobox(self.section_preset_combo, self.colors)
-        self.section_preset_combo.bind("<<ComboboxSelected>>", self._on_section_preset_pick)
-        make_secondary_button(sec_tools, "Select sections", self._open_sections_picker, self.colors).pack(
-            side=tk.LEFT,
-        )
+        bar.reflow()
 
         self._audio_log_host = ttk.Frame(inner)
         self._audio_log_host.grid(row=1, column=0, sticky="nsew")
+        self.after_idle(self._sync_work_tab_heights)
 
     def _inline_chip(self, parent: tk.Misc, label: str, *, pack: bool = True) -> ttk.Frame:
         """Compact card that hugs its label + contents."""
@@ -887,17 +1713,16 @@ class NovelflowApp(tk.Tk):
     def _make_icon_button(
         self, parent: tk.Misc, icon: str, command, *, title: str = "", bg: str | None = None,
         small: bool = False,
-    ) -> tk.Button:
+    ) -> CanvasButton:
         scale = self._ui_scale
         base_bg = bg or self.colors["bg"]
-        btn = tk.Button(
-            parent, text=icon, command=command,
-            bg=base_bg, fg=self.colors["muted"],
-            activebackground=self.colors["surface"], activeforeground=self.colors["text"],
-            relief=tk.FLAT, bd=0, cursor="hand2",
-            padx=space(1 if small else 2, scale), pady=space(0 if small else 1, scale),
-            font=typeface("caption" if small else "body", scale),
+        btn = CanvasButton(
+            parent, icon, command, colors=self.colors, variant="icon",
+            font_role="caption" if small else "body",
+            pad_x=space(2 if small else 3, scale),
+            pad_y=space(1 if small else 2, scale),
         )
+        btn.configure(bg=base_bg)
         if title:
             def _tip_in(_e, t=title) -> None:
                 self.status_var.set(t)
@@ -906,18 +1731,12 @@ class NovelflowApp(tk.Tk):
                     self.status_var.set("Ready — choose a PDF or markdown file to begin")
             btn.bind("<Enter>", _tip_in, add="+")
             btn.bind("<Leave>", _tip_out, add="+")
-        def on_enter(_e) -> None:
-            btn.configure(bg=self.colors["surface"], fg=self.colors["text"])
-        def on_leave(_e) -> None:
-            btn.configure(bg=base_bg, fg=self.colors["muted"])
-        btn.bind("<Enter>", on_enter, add="+")
-        btn.bind("<Leave>", on_leave, add="+")
         return btn
 
     def _make_round_play_button(self, parent: tk.Misc, command) -> tk.Canvas:
         """Spotify-style circular play/pause control drawn on a canvas."""
         scale = self._ui_scale
-        diameter = max(68, int(76 * scale))
+        diameter = max(88, int(98 * scale))
         pad = 2
         bg = self.colors["card"]
         canvas = tk.Canvas(
@@ -975,32 +1794,17 @@ class NovelflowApp(tk.Tk):
 
     def _make_player_icon_button(
         self, parent: tk.Misc, label: str, command, *, large: bool = False,
-    ) -> tk.Button:
+    ) -> CanvasButton:
         """Transport control for the player row."""
         scale = self._ui_scale
-        role = "title" if large else "body"
-        btn = tk.Button(
-            parent, text=label, command=command,
-            bg=self.colors["card"], fg=self.colors["text"],
-            activebackground=self.colors["card_hover"], activeforeground=self.colors["text"],
-            relief=tk.FLAT, bd=0, cursor="hand2",
-            padx=space(3 if large else 2, scale),
-            pady=space(2 if large else 1, scale),
-            font=typeface(role, scale, weight="bold" if large else "normal"),
-            highlightthickness=0,
+        btn = CanvasButton(
+            parent, label, command, colors=self.colors, variant="player",
+            font_role="title" if large else "body",
+            font_weight="bold" if large else None,
+            pad_x=space(4 if large else 3, scale),
+            pad_y=space(3 if large else 2, scale),
         )
-        track_font(btn, role, self.colors, weight="bold" if large else "normal")
-
-        def on_enter(_e) -> None:
-            if str(btn["state"]) != tk.DISABLED:
-                btn.configure(fg=self.colors["accent"])
-
-        def on_leave(_e) -> None:
-            if str(btn["state"]) != tk.DISABLED:
-                btn.configure(fg=self.colors["text"])
-
-        btn.bind("<Enter>", on_enter)
-        btn.bind("<Leave>", on_leave)
+        btn.configure(bg=self.colors["card"])
         return btn
 
     def _set_play_button_enabled(self, *, enabled: bool) -> None:
@@ -1014,13 +1818,17 @@ class NovelflowApp(tk.Tk):
             btn.itemconfigure(item, fill=icon_fill)
         btn.configure(cursor="hand2" if enabled else "arrow")
 
-    def _player_centered_strip(self, parent: ttk.Frame, *, row: int, pady) -> ttk.Frame:
-        """Center a control row at 80% of the available width (10 / 80 / 10)."""
+    def _player_centered_strip(
+        self, parent: ttk.Frame, *, row: int, pady, width_pct: int = 60,
+    ) -> ttk.Frame:
+        """Center a control row at ``width_pct`` of the available width."""
+        side = max(1, (100 - width_pct) // 2)
+        center = max(1, width_pct)
         outer = ttk.Frame(parent, style="Card.TFrame")
         outer.grid(row=row, column=0, sticky="ew", pady=pady)
-        outer.columnconfigure(0, weight=10)
-        outer.columnconfigure(1, weight=80)
-        outer.columnconfigure(2, weight=10)
+        outer.columnconfigure(0, weight=side)
+        outer.columnconfigure(1, weight=center)
+        outer.columnconfigure(2, weight=side)
         inner = ttk.Frame(outer, style="Card.TFrame")
         inner.grid(row=0, column=1, sticky="ew")
         return inner
@@ -1030,16 +1838,31 @@ class NovelflowApp(tk.Tk):
     def _build_player_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
-        inner, self._player_outline_shell = self._make_tab_outline(parent, expand=True)
-        ttk.Label(inner, text="Player", style="Heading.TLabel").pack(anchor="w")
-        ttk.Label(inner, textvariable=self.player_title_var, style="Muted.TLabel").pack(
-            anchor="w", pady=(space(1, self._ui_scale), space(2, self._ui_scale)),
+        inner, self._player_outline_shell = self._make_tab_outline(
+            parent, expand=True, padding=self._player_tab_shell_pad(),
+        )
+        inner.columnconfigure(0, weight=1)
+        inner.rowconfigure(0, weight=0)
+        inner.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(inner)
+        top.grid(row=0, column=0, sticky="new")
+        top.columnconfigure(0, weight=1)
+        self._player_work_top = top
+        self._make_section_heading(top, "Player").pack(anchor="w")
+        ttk.Label(top, textvariable=self.player_title_var, style="PlayerFileTitle.TLabel").pack(
+            anchor="w", pady=self._work_tab_subtitle_pady(),
         )
 
-        lib_card = make_card(inner, self.colors)
-        lib_card.pack(fill=tk.X, pady=(0, space(3, self._ui_scale)))
-        lib_body = ttk.Frame(lib_card._card_inner, style="Card.TFrame", padding=space(4, self._ui_scale))  # type: ignore[attr-defined]
-        lib_body.pack(fill=tk.X)
+        lib_card = make_card(top, self.colors)
+        lib_card.pack(fill=tk.X, pady=(0, space(2, self._ui_scale)))
+        self._player_lib_card = lib_card
+        lib_pad = space(3, self._ui_scale)
+        lib_body = ttk.Frame(
+            lib_card._card_inner, style="Card.TFrame",
+            padding=(lib_pad, lib_pad, lib_pad, space(2, self._ui_scale)),
+        )  # type: ignore[attr-defined]
+        lib_body.pack(fill=tk.X, anchor="nw")
         lib_body.columnconfigure(1, weight=1)
         gap = space(2, self._ui_scale)
 
@@ -1050,7 +1873,7 @@ class NovelflowApp(tk.Tk):
         lib_dir_row.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, gap))
         lib_dir_row.columnconfigure(0, weight=1)
         self.audiobook_lib_dir_entry = make_path_entry(lib_dir_row, self.audiobook_lib_dir_var, self.colors)
-        self.audiobook_lib_dir_entry.grid(row=0, column=0, sticky="ew", ipady=space(1, self._ui_scale))
+        self.audiobook_lib_dir_entry.grid(row=0, column=0, sticky="ew")
         make_browse_button(lib_dir_row, "Choose folder…", self._browse_audiobook_library_folder, self.colors).grid(
             row=0, column=1, padx=(gap, 0),
         )
@@ -1075,107 +1898,99 @@ class NovelflowApp(tk.Tk):
         self._configure_player_styles()
 
         self._player_controls_card = make_card(inner, self.colors)
-        self._player_controls_card.pack(fill=tk.BOTH, expand=True)
-        cbody = ttk.Frame(self._player_controls_card._card_inner, style="Card.TFrame", padding=space(5, self._ui_scale))  # type: ignore[attr-defined]
+        self._player_controls_card.grid(
+            row=1, column=0, sticky="nsew", pady=(space(2, self._ui_scale), space(1, self._ui_scale)),
+        )
+        card_pad = space(5, self._ui_scale)
+        cbody = ttk.Frame(
+            self._player_controls_card._card_inner,
+            style="Card.TFrame",
+            padding=(card_pad, card_pad, card_pad, space(3, self._ui_scale)),
+        )  # type: ignore[attr-defined]
         cbody.pack(fill=tk.BOTH, expand=True)
         cbody.columnconfigure(0, weight=1)
         cbody.rowconfigure(0, weight=1)
         cbody.rowconfigure(1, weight=0)
-        cbody.rowconfigure(2, weight=1)
-        cbody.rowconfigure(3, weight=0)
 
         gap = space(3, self._ui_scale)
-        sp = space(4, self._ui_scale)
         player_shell = ttk.Frame(cbody, style="Card.TFrame")
-        player_shell.grid(row=1, column=0, sticky="ew")
+        player_shell.grid(row=0, column=0, sticky="nsew")
         player_shell.columnconfigure(0, weight=1)
         player_shell.rowconfigure(0, weight=1)
 
-        main_center = ttk.Frame(player_shell, style="Card.TFrame")
-        main_center.grid(row=0, column=0, sticky="nsew")
-        main_center.columnconfigure(0, weight=1)
-        main_center.rowconfigure(0, weight=1)
-        main_center.rowconfigure(1, weight=0)
-        main_center.rowconfigure(2, weight=1)
-
-        main = ttk.Frame(main_center, style="Card.TFrame")
-        main.grid(row=1, column=0, sticky="ew")
+        main = ttk.Frame(player_shell, style="Card.TFrame")
+        main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=70)
+        main.rowconfigure(1, weight=30)
 
-        title_block = ttk.Frame(main, style="Card.TFrame")
-        title_block.grid(row=0, column=0, sticky="ew", pady=(0, gap))
+        playback_zone = ttk.Frame(main, style="Card.TFrame")
+        playback_zone.grid(row=0, column=0, sticky="nsew")
+        playback_zone.columnconfigure(0, weight=1)
+        playback_zone.rowconfigure(0, weight=1)
+        playback_zone.rowconfigure(1, weight=0)
+        playback_zone.rowconfigure(2, weight=1)
+
+        playback_cluster = ttk.Frame(playback_zone, style="Card.TFrame")
+        playback_cluster.grid(row=1, column=0, sticky="ew")
+        playback_cluster.columnconfigure(0, weight=1)
+        self._playback_cluster = playback_cluster
+
+        title_block = ttk.Frame(playback_cluster, style="Card.TFrame")
+        title_block.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             title_block, textvariable=self.player_chapter_title_var,
-            style="CardHeading.TLabel", anchor="center",
+            style="PlayerChapterTitle.TLabel", anchor="center",
         ).pack(fill=tk.X)
         ttk.Label(
             title_block, textvariable=self.player_chapter_sub_var,
-            style="CardMuted.TLabel", anchor="center",
+            style="CardHeading.TLabel", anchor="center",
         ).pack(fill=tk.X, pady=(space(1, self._ui_scale), 0))
 
-        ch_seek = ttk.Frame(main, style="Card.TFrame")
-        ch_seek.grid(row=1, column=0, sticky="ew", pady=(0, sp))
-        ch_seek.columnconfigure(1, weight=1)
-        time_w = 9
+        player_strip = self._player_centered_strip(
+            playback_cluster, row=1,
+            pady=(space(4, self._ui_scale), space(2, self._ui_scale)),
+            width_pct=60,
+        )
+        self._player_strip = player_strip
+        self._player_strip_gap_units = 0.5
+        pc = configure_gutter_grid(player_strip, scale=self._ui_scale, gap_units=self._player_strip_gap_units)
+        self._player_strip_gap_cols = (pc["gap_l"], pc["gap_r"])
+        ctrl_pad = (space(2, self._ui_scale), 0)
+
         ttk.Label(
-            ch_seek, textvariable=self.player_chapter_elapsed_var,
-            style="PlayerTime.TLabel", width=time_w, anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=(0, gap))
+            player_strip, textvariable=self.player_chapter_elapsed_var,
+            style="PlayerTime.TLabel", anchor="w",
+        ).grid(row=0, column=pc["left"], sticky="w")
         self.seek_scale = ttk.Scale(
-            ch_seek, from_=0, to=1000, orient=tk.HORIZONTAL, variable=self.seek_var,
+            player_strip, from_=0, to=1000, orient=tk.HORIZONTAL, variable=self.seek_var,
             style="Player.Horizontal.TScale", command=self._on_seek_drag,
         )
-        self.seek_scale.grid(row=0, column=1, sticky="ew")
+        self.seek_scale.grid(
+            row=0, column=pc["center"], sticky="ew", ipady=space(2, self._ui_scale),
+        )
         self.seek_scale.bind("<Button-1>", self._on_seek_press)
         self.seek_scale.bind("<B1-Motion>", self._on_seek_motion)
         self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
         ttk.Label(
-            ch_seek, textvariable=self.player_chapter_total_var,
-            style="PlayerTime.TLabel", width=time_w, anchor="e",
-        ).grid(row=0, column=2, sticky="e", padx=(gap, 0))
-
-        book_block = ttk.Frame(main, style="Card.TFrame")
-        book_block.grid(row=2, column=0, sticky="ew", pady=(sp * 2, gap))
-        book_block.columnconfigure(0, weight=1)
-        book_hdr = ttk.Frame(book_block, style="Card.TFrame")
-        book_hdr.grid(row=0, column=0, sticky="ew", pady=(0, gap))
-        book_hdr.columnconfigure(1, weight=1)
-        ttk.Label(book_hdr, text="Book progress", style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
-        book_times = ttk.Frame(book_hdr, style="Card.TFrame")
-        book_times.grid(row=0, column=1, sticky="e")
-        ttk.Label(
-            book_times, textvariable=self.player_book_elapsed_var,
+            player_strip, textvariable=self.player_chapter_total_var,
             style="PlayerTime.TLabel", anchor="e",
-        ).pack(side=tk.LEFT)
-        ttk.Label(book_times, text=" / ", style="CardMuted.TLabel").pack(side=tk.LEFT)
-        ttk.Label(
-            book_times, textvariable=self.player_book_total_var,
-            style="PlayerTime.TLabel", anchor="e",
-        ).pack(side=tk.LEFT)
+        ).grid(row=0, column=pc["right"], sticky="e")
 
-        playback_hub = ttk.Frame(book_block, style="Card.TFrame")
-        playback_hub.grid(row=1, column=0, sticky="ew")
-        playback_hub.columnconfigure(0, weight=1)
-
-        book_tl_wrap = ttk.Frame(playback_hub, style="Card.TFrame")
-        book_tl_wrap.grid(row=0, column=0, sticky="ew")
-        book_tl_wrap.columnconfigure(0, weight=1)
-        book_tl_wrap.rowconfigure(0, weight=0)
-        self._build_book_timeline(book_tl_wrap)
-
-        controls_hub = ttk.Frame(playback_hub, style="Card.TFrame")
-        controls_hub.grid(row=1, column=0, sticky="ew", pady=(sp, 0))
-        controls_hub.columnconfigure(0, weight=1)
-        controls_hub.columnconfigure(1, weight=0)
-        controls_hub.columnconfigure(2, weight=1)
-
-        vol_strip = tk.Frame(controls_hub, bg=self.colors["card"])
-        vol_strip.grid(row=0, column=0, sticky="w", padx=(0, gap))
         self._vol_icon = tk.Label(
-            vol_strip, text="🔈", bg=self.colors["card"], fg=self.colors["muted"],
+            player_strip, text="🔈", bg=self.colors["card"], fg=self.colors["muted"],
             font=typeface("title", self._ui_scale),
         )
-        self._vol_icon.pack(side=tk.LEFT, padx=(0, gap))
+        self._vol_icon.grid(row=1, column=pc["left"], sticky="w", pady=ctrl_pad)
+
+        center_controls = ttk.Frame(player_strip, style="Card.TFrame")
+        center_controls.grid(row=1, column=pc["center"], sticky="ew", pady=ctrl_pad)
+        center_controls.columnconfigure(0, weight=0)
+        center_controls.columnconfigure(1, weight=1)
+        center_controls.columnconfigure(2, weight=0)
+
+        vol_strip = tk.Frame(center_controls, bg=self.colors["card"])
+        vol_strip.grid(row=0, column=0, sticky="w")
         self.volume_scale = ttk.Scale(
             vol_strip, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.volume_var,
             command=self._on_volume_change, style="Player.Horizontal.TScale",
@@ -1190,7 +2005,7 @@ class NovelflowApp(tk.Tk):
         self._vol_pct.pack(side=tk.LEFT, padx=(gap, 0))
         track_font(self._vol_pct, "caption", self.colors)
 
-        transport = ttk.Frame(controls_hub, style="Card.TFrame")
+        transport = ttk.Frame(center_controls, style="Card.TFrame")
         transport.grid(row=0, column=1)
         btn_pad = (0, gap)
         self.prev_btn = self._make_player_icon_button(transport, "|◀", self._player_prev, large=True)
@@ -1212,19 +2027,55 @@ class NovelflowApp(tk.Tk):
         self.next_btn = self._make_player_icon_button(transport, "▶|", self._player_next, large=True)
         self.next_btn.pack(side=tk.LEFT, padx=btn_pad)
 
-        speed_strip = ttk.Frame(controls_hub, style="Card.TFrame")
-        speed_strip.grid(row=0, column=2, sticky="e", padx=(gap, 0))
-        ttk.Label(speed_strip, text="Speed", style="CardMuted.TLabel").pack(side=tk.LEFT, padx=(0, gap))
+        ttk.Label(center_controls, text="Speed", style="CardMuted.TLabel").grid(
+            row=0, column=2, sticky="e", padx=(gap, 0),
+        )
+
         self.speed_combo = ttk.Combobox(
-            speed_strip, textvariable=self.speed_var, state="readonly", width=6, style="Dark.TCombobox",
+            player_strip, textvariable=self.speed_var, state="readonly", width=6, style="Dark.TCombobox",
             values=("0.75×", "1.0×", "1.25×", "1.5×", "1.75×", "2.0×"),
         )
-        self.speed_combo.pack(side=tk.LEFT)
+        self.speed_combo.grid(row=1, column=pc["right"], sticky="e", pady=ctrl_pad)
         configure_dark_combobox(self.speed_combo, self.colors)
         self.speed_combo.bind("<<ComboboxSelected>>", self._on_speed_change)
 
+        book_block = ttk.Frame(main, style="Card.TFrame")
+        book_block.grid(row=1, column=0, sticky="nsew")
+        book_block.columnconfigure(0, weight=1)
+        book_block.rowconfigure(0, weight=1)
+        book_block.rowconfigure(1, weight=0)
+
+        book_bottom = ttk.Frame(book_block, style="Card.TFrame")
+        book_bottom.grid(row=1, column=0, sticky="esw")
+        book_bottom.columnconfigure(0, weight=1)
+
+        book_hdr = ttk.Frame(book_bottom, style="Card.TFrame")
+        book_hdr.grid(row=0, column=0, sticky="ew", pady=(0, space(2, self._ui_scale)))
+        book_hdr.columnconfigure(1, weight=1)
+        ttk.Label(book_hdr, text="Book progress", style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
+        book_times = ttk.Frame(book_hdr, style="Card.TFrame")
+        book_times.grid(row=0, column=1, sticky="e")
+        ttk.Label(
+            book_times, textvariable=self.player_book_elapsed_var,
+            style="PlayerTime.TLabel", anchor="e",
+        ).pack(side=tk.LEFT)
+        ttk.Label(book_times, text=" / ", style="CardMuted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(
+            book_times, textvariable=self.player_book_total_var,
+            style="PlayerTime.TLabel", anchor="e",
+        ).pack(side=tk.LEFT)
+
+        book_tl_wrap = ttk.Frame(book_bottom, style="Card.TFrame")
+        book_tl_wrap.grid(row=1, column=0, sticky="esw")
+        book_tl_wrap.columnconfigure(0, weight=1)
+        self._player_book_block = book_block
+        self._book_hdr = book_hdr
+        self._book_bottom = book_bottom
+        self._build_book_timeline(book_tl_wrap)
+        book_block.bind("<Configure>", lambda _e: self._resize_book_timeline(), add="+")
+
         player_footer = ttk.Frame(cbody, style="Card.TFrame")
-        player_footer.grid(row=3, column=0, sticky="e", pady=(sp, 0))
+        player_footer.grid(row=1, column=0, sticky="e", pady=(space(2, self._ui_scale), 0))
         self.player_open_ext_btn = self._make_icon_button(
             player_footer, "↗", self._open_audiobook_file, title="Open externally",
             bg=self.colors["card"], small=True,
@@ -1233,19 +2084,57 @@ class NovelflowApp(tk.Tk):
 
         self._refresh_volume_ui()
         self._set_player_controls(enabled=False)
+        self.after_idle(self._sync_player_chrome_layout)
+        self.after_idle(self._sync_work_tab_heights)
+
+    def _book_timeline_min_height(self) -> int:
+        return max(56, int(64 * self._ui_scale))
+
+    def _book_timeline_height(self) -> int:
+        """Half of the book-block area below the header, bottom-anchored."""
+        min_h = self._book_timeline_min_height()
+        half_floor = max(28, min_h // 2)
+        try:
+            self._player_book_block.update_idletasks()
+            block_h = self._player_book_block.winfo_height()
+            hdr_h = self._book_hdr.winfo_height() if hasattr(self, "_book_hdr") else 0
+            area_h = max(block_h - hdr_h, min_h)
+            if area_h > 1:
+                return max(half_floor, max(area_h, min_h) // 2)
+        except (tk.TclError, AttributeError):
+            pass
+        return half_floor
+
+    def _resize_book_timeline(self) -> None:
+        if not hasattr(self, "_book_tl"):
+            return
+        try:
+            h = self._book_timeline_height()
+            if abs(h - self._book_tl.winfo_height()) >= 2:
+                self._book_tl.configure(height=h)
+                self._draw_book_timeline()
+        except tk.TclError:
+            pass
+
+    def _sync_player_chrome_layout(self) -> None:
+        """Tight library card + bottom-anchored book timeline sizing."""
+        try:
+            if hasattr(self, "_player_lib_card"):
+                fit_round_surface_to_content(self._player_lib_card, scale=self._ui_scale)
+            self._resize_book_timeline()
+        except tk.TclError:
+            pass
 
     # ---- book timeline (DAW-style chapter strips) ---------------------------
-
-    _BOOK_TIMELINE_H = 44
 
     def _build_book_timeline(self, parent: ttk.Frame) -> None:
         self._book_tl_wrap = parent
         self._book_tl_regions: list[tuple[int, int, str, int]] = []
         self._book_tl = tk.Canvas(
-            parent, height=self._BOOK_TIMELINE_H, bg=self.colors["surface"],
-            highlightthickness=1, highlightbackground=self.colors["border_subtle"], bd=0,
+            parent, height=self._book_timeline_min_height() // 2, bg=self.colors["card"],
+            highlightthickness=0, bd=0, cursor="hand2",
         )
-        self._book_tl.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        self._book_tl.grid(row=0, column=0, sticky="esw")
         self._book_tl_resize_after: str | None = None
         self._book_tl_last_width = 0
         parent.bind("<Configure>", self._schedule_book_timeline_redraw, add="+")
@@ -1341,25 +2230,23 @@ class NovelflowApp(tk.Tk):
             if width <= 1:
                 return
             self._book_tl_last_width = width
-            h = self._BOOK_TIMELINE_H
+            h = self._book_timeline_height()
             self._book_tl.configure(width=width)
             self._book_tl.delete("all")
             self._book_tl_regions.clear()
 
-            pad_x, pad_y = 4, 8
-            track_y0, track_y1 = pad_y, h - pad_y
+            pad_x, pad_y = 4, max(2, int(4 * self._ui_scale))
             inner_w = max(width - pad_x * 2, 1)
-
-            self._book_tl.create_rectangle(
-                pad_x, track_y0, width - pad_x, track_y1,
-                fill=self.colors["border_subtle"], outline=self.colors["border"], width=1,
-            )
+            top = pad_y + 1
+            bot = h - pad_y - 1
+            seg_r = max(2, min(3, int(2 * self._ui_scale)))
 
             chapters = self._player_chapters
             if not chapters:
-                self._book_tl.create_text(
-                    width // 2, h // 2, text="Load an audiobook to see chapters",
-                    fill=self.colors["muted"], font=typeface("caption", self._ui_scale),
+                r = min(seg_r, max(1, inner_w // 2), max(1, (bot - top) // 2))
+                draw_round_rect(
+                    self._book_tl, pad_x, top, pad_x + inner_w, bot, r,
+                    fill=self.colors["border_subtle"], outline="",
                 )
                 return
 
@@ -1367,74 +2254,49 @@ class NovelflowApp(tk.Tk):
             total = sum(durations) or 1
             current = self._player.index if self._player_playable else -1
             enabled = self._book_timeline_enabled and self._player_playable
-            acc = 0
-            divider_xs: list[int] = []
+            n = len(chapters)
+            gap = max(2, int(3 * self._ui_scale))
+            total_gaps = gap * (n - 1) if n > 1 else 0
+            usable = max(inner_w - total_gaps, n)
+            x_cursor = pad_x
 
             for i, dur in enumerate(durations):
-                x0 = pad_x + int(acc / total * inner_w)
-                x1 = pad_x + int((acc + dur) / total * inner_w)
-                acc += dur
-                if x1 <= x0:
-                    x1 = x0 + 1
+                seg_w = max(int(dur / total * usable), 2)
+                x0 = x_cursor
+                x1 = x0 + seg_w
+                x_cursor = x1 + (gap if i < n - 1 else 0)
                 fill = self._book_timeline_fill(i, current=current, enabled=enabled)
-                top = track_y0 + 2
-                bot = track_y1 - 2
                 self._book_tl_regions.append((x0, x1, chapters[i].title, i))
-                self._book_tl.create_rectangle(x0, top, x1, bot, fill=fill, outline="", width=0)
+                r = min(seg_r, max(1, (x1 - x0) // 2), max(1, (bot - top) // 2))
+                draw_round_rect(self._book_tl, x0, top, x1, bot, r, fill=fill, outline="")
                 if i == current and enabled:
-                    self._book_tl.create_rectangle(
-                        x0, top, x1, bot, outline=self.colors["glow"], width=2,
+                    draw_round_rect(
+                        self._book_tl, x0, top, x1, bot, r,
+                        fill="", outline=self.colors["glow"], width=1,
                     )
-                    self._book_tl.create_rectangle(
-                        x0, top, x1, top + 3, fill=self.colors["glow"], outline="", width=0,
-                    )
-                block_w = x1 - x0
-                if block_w > 6 and enabled and i == current:
-                    bar_w, gap = 2, 1
-                    n_bars = max(1, (block_w - 4) // (bar_w + gap))
-                    wave_color = "#ffffff"
-                    for b in range(n_bars):
-                        bx = x0 + 2 + b * (bar_w + gap)
-                        if bx + bar_w >= x1 - 1:
-                            break
-                        seed = (i * 997 + b * 131) % 1000 / 1000.0
-                        bh = int((0.25 + 0.65 * seed) * (bot - top - 6))
-                        by0 = bot - 2 - bh
-                        self._book_tl.create_rectangle(
-                            bx, by0, bx + bar_w, bot - 2, fill=wave_color, outline="", width=0,
-                            stipple="gray50" if i != current else "",
-                        )
-                if i > 0:
-                    divider_xs.append(x0)
-
-            for dx in divider_xs:
-                self._book_tl.create_line(
-                    dx, 0, dx, h, fill=self.colors["text"], width=2,
-                )
 
             frac = self.book_seek_var.get() / 1000.0
             play_x = pad_x + int(frac * inner_w)
-            self._book_tl.create_line(
-                play_x, 0, play_x, h,
-                fill="#ffffff" if enabled else self.colors["muted"], width=2,
-            )
-            self._book_tl.create_polygon(
-                play_x - 5, 2, play_x + 5, 2, play_x, 10,
-                fill="#ffffff" if enabled else self.colors["muted"], outline="",
-            )
+            if enabled:
+                play_color = "#ffffff"
+                line_w = max(2, int(3 * self._ui_scale))
+                cap = max(4, int(5 * self._ui_scale))
+                self._book_tl.create_line(
+                    play_x, 0, play_x, h, fill=play_color, width=line_w, tags=("playhead",),
+                )
+                self._book_tl.create_polygon(
+                    play_x - cap, 0, play_x + cap, 0, play_x, cap,
+                    fill=play_color, outline="", tags=("playhead",),
+                )
+                self._book_tl.tag_raise("playhead")
+            else:
+                self._book_tl.create_line(
+                    play_x, top, play_x, bot, fill=self.colors["muted"], width=2, tags=("playhead",),
+                )
         except tk.TclError:
             pass
 
     # ---- volume ---------------------------------------------------------------
-
-    def _sync_volume_scale_length(self, _event=None) -> None:
-        if not hasattr(self, "volume_scale"):
-            return
-        try:
-            length = max(int(120 * self._ui_scale), 100)
-            self.volume_scale.configure(length=length)
-        except tk.TclError:
-            pass
 
     def _refresh_volume_ui(self) -> None:
         vol = self.volume_var.get()
@@ -1712,7 +2574,7 @@ class NovelflowApp(tk.Tk):
 
         head = ttk.Frame(outer)
         head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, space(2, self._ui_scale)))
-        ttk.Label(head, text="Select sections", style="Heading.TLabel").pack(side=tk.LEFT)
+        self._make_subsection_heading(head, "Select sections", side=tk.LEFT)
         self._picker_count_var = tk.StringVar()
         ttk.Label(head, textvariable=self._picker_count_var, style="Muted.TLabel").pack(
             side=tk.LEFT, padx=(space(2, self._ui_scale), 0),
@@ -1855,6 +2717,7 @@ class NovelflowApp(tk.Tk):
         voices = voices_for_engine("edge")
         labels = [f"{v.label} ({v.id})" for v in voices]
         self.voice_combo.configure(values=labels)
+        fit_combobox(self.voice_combo, labels, scale=self._ui_scale, min_chars=18, max_chars=32)
         default = default_voice("edge")
         for idx, voice in enumerate(voices):
             if voice.id == default:
@@ -1964,8 +2827,8 @@ class NovelflowApp(tk.Tk):
         self._current_progress_pct = 0.0
         self._current_progress_label = ""
         self.progress_meta_var.set("")
-        if hasattr(self, "_footer_progress_pct_var"):
-            self._footer_progress_pct_var.set("0%")
+        self._sync_footer_title()
+        self._draw_footer_bar()
 
     # ---- log ----------------------------------------------------------------
 
@@ -1987,13 +2850,35 @@ class NovelflowApp(tk.Tk):
 
     # ---- form helpers -------------------------------------------------------
 
-    def _field_row(self, parent, row: int, label: str, variable: tk.StringVar, browse_cmd) -> tk.Entry:
+    def _field_row(
+        self,
+        parent,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        browse_cmd,
+        *,
+        on_card: bool = True,
+    ) -> tk.Entry:
         gap = space(3, self._ui_scale)
-        ttk.Label(parent, text=label, style="CardFormLabel.TLabel", width=12).grid(row=row, column=0, sticky="w", pady=gap)
+        ipady = control_metrics(self._ui_scale)["path_ipady"]
+        label_style = "CardFormLabel.TLabel" if on_card else "FormLabel.TLabel"
+        ttk.Label(parent, text=label, style=label_style, width=12).grid(row=row, column=0, sticky="w", pady=gap)
         entry = make_path_entry(parent, variable, self.colors)
-        entry.grid(row=row, column=1, sticky="ew", padx=(gap, gap), pady=gap, ipady=space(1, self._ui_scale))
-        make_browse_button(parent, "Browse", browse_cmd, self.colors).grid(row=row, column=2, pady=gap)
+        entry.grid(row=row, column=1, sticky="ew", padx=(gap, gap), pady=gap, ipady=ipady)
+        browse = make_browse_button(parent, "Browse", browse_cmd, self.colors)
+        browse.grid(row=row, column=2, pady=gap, ipady=ipady)
+        entry._browse_btn = browse  # type: ignore[attr-defined]
         return entry
+
+    def _blend_path_entry(self, entry: tk.Entry, *, surface: str | None = None) -> None:
+        """Path field blended into its surface — no harsh focus ring."""
+        bg = surface if surface is not None else self.colors["card"]
+        subtle = self.colors["border_subtle"]
+        entry.configure(highlightbackground=bg, highlightcolor=subtle)
+        browse = getattr(entry, "_browse_btn", None)
+        if browse is not None:
+            browse.configure(highlightbackground=bg, highlightcolor=subtle)
 
     @staticmethod
     def _sync_entry(entry: tk.Entry, value: str) -> None:
@@ -2053,20 +2938,14 @@ class NovelflowApp(tk.Tk):
             return
         src = Path(resolved)
         self.source_var.set(resolved)
-        self._sync_entry(self.source_entry, resolved)
         if src.suffix.lower() == ".md":
             self.output_var.set(resolved)
-            self._sync_entry(self.output_entry, resolved)
-            md = src
+            self._sync_output_entry(resolved)
         else:
             md = self._markdown_target(src)
-        if not self.output_var.get().strip():
-                self.output_var.set(str(md))
-                self._sync_entry(self.output_entry, str(md))
-        if md.is_file():
-            self._load_sections_from_markdown(md)
-        if not self.audiobook_lib_dir_var.get().strip():
-            self._set_audiobook_library_folder(str(src.parent))
+            self.output_var.set(str(md))
+            self._sync_output_entry(str(md))
+        self._sync_workflow_from_inputs()
         self.status_var.set(f"Selected: {src.name}")
         self.update_idletasks()
 
@@ -2086,7 +2965,8 @@ class NovelflowApp(tk.Tk):
         if path:
             resolved = self._normalize_path(path)
             self.output_var.set(resolved)
-            self._sync_entry(self.output_entry, resolved)
+            self._sync_output_entry(resolved)
+            self._sync_workflow_from_inputs()
 
     # ---- busy state ---------------------------------------------------------
 
@@ -2102,6 +2982,8 @@ class NovelflowApp(tk.Tk):
             self.status_var.set("Working…")
         else:
             self.status_var.set("Ready")
+        self._sync_footer_title()
+        self._draw_footer_bar()
 
     def _audiobook_output_path(self, markdown_path: Path, audio_format: str) -> Path:
         stem = markdown_path.stem
@@ -2237,7 +3119,7 @@ class NovelflowApp(tk.Tk):
         self._last_output = output_path
         self._last_audiobook = audio_path if audio_path and audio_path.is_file() else None
         self._progress_start = None
-        self._set_progress(100, "Complete")
+        self._set_progress(100)
         self._set_busy(False)
         self.open_btn.configure(state=tk.NORMAL)
         if output_path.suffix.lower() == ".md" and output_path.is_file():
@@ -2313,16 +3195,17 @@ class NovelflowApp(tk.Tk):
     # ---- open helpers -------------------------------------------------------
 
     def _open_audiobook_file(self) -> None:
-        if not self._last_audiobook:
+        path = self._resolve_playable_audiobook() or self._last_audiobook
+        if not path:
             return
-        path = self._resolve_external_audiobook_path(self._last_audiobook)
-        if path is None:
+        resolved = self._resolve_external_audiobook_path(path)
+        if resolved is None:
             self._show_toast(
                 "No merged audiobook file found — use Play in app (section audio is still available).",
                 kind="info",
             )
             return
-        self._open_path(path)
+        self._open_path(resolved)
 
     @staticmethod
     def _resolve_external_audiobook_path(path: Path) -> Path | None:
@@ -2418,7 +3301,11 @@ class NovelflowApp(tk.Tk):
             return
         pick = self.audiobook_lib_pick_var.get()
         if pick not in labels:
-            self.audiobook_lib_pick_var.set(labels[0])
+            md = self._current_markdown_path()
+            if md is not None:
+                self._select_library_audiobook_for_markdown(md)
+            else:
+                self.audiobook_lib_pick_var.set(labels[0])
         self.audiobook_lib_open_btn.configure(state=tk.NORMAL)
 
     def _selected_library_audiobook(self) -> Path | None:
@@ -2439,9 +3326,11 @@ class NovelflowApp(tk.Tk):
         self.notebook.select(2)
 
     def _on_audiobook_library_pick(self, _event=None) -> None:
-        self.audiobook_lib_open_btn.configure(
-            state=tk.NORMAL if self._audiobook_lib_entries else tk.DISABLED,
-        )
+        path = self._selected_library_audiobook()
+        if path is not None:
+            self._last_audiobook = path
+        self._sync_audiobook_action_buttons()
+        self._sync_player_document_label()
 
     # ---- player -------------------------------------------------------------
 
@@ -2450,7 +3339,7 @@ class NovelflowApp(tk.Tk):
         if style is None:
             return
         try:
-            thumb = max(10, int(12 * self._ui_scale))
+            thumb = max(12, int(16 * self._ui_scale))
             for name, trough in (
                 ("Player.Horizontal.TScale", self.colors["border_subtle"]),
                 ("Player.Book.Horizontal.TScale", self.colors["surface"]),
@@ -2475,6 +3364,10 @@ class NovelflowApp(tk.Tk):
         except tk.TclError:
             pass
 
+    def _set_player_chapter_placeholders(self) -> None:
+        self.player_chapter_title_var.set(_PLAYER_CHAPTER_TITLE_PLACEHOLDER)
+        self.player_chapter_sub_var.set(_PLAYER_CHAPTER_SUB_PLACEHOLDER)
+
     def _set_player_controls(self, *, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
         for btn in (self.prev_btn, self.next_btn, self.back10_btn, self.fwd10_btn):
@@ -2485,14 +3378,66 @@ class NovelflowApp(tk.Tk):
         if hasattr(self, "_book_tl"):
             self._book_tl.configure(cursor="hand2" if enabled else "arrow")
             self._draw_book_timeline()
+        if not enabled:
+            self._set_player_chapter_placeholders()
         # Volume and speed stay editable at all times — the chosen values are
         # remembered and applied as soon as playback starts.
 
     def _play_last_in_app(self) -> None:
-        if self._last_audiobook and self._last_audiobook.is_file():
-            self._load_into_player(self._last_audiobook)
-            self.notebook.select(2)
-            self._player_toggle()
+        path = self._resolve_playable_audiobook()
+        if path is None:
+            self._show_toast("No playable audiobook found for this document.", kind="warn")
+            return
+        self._load_into_player(path)
+        self.notebook.select(2)
+        self._player_toggle()
+
+    def _resolve_playable_audiobook(self) -> Path | None:
+        """Best playable path: library pick, last run, expected file, or chapter sidecar."""
+        candidates: list[Path | None] = [
+            self._selected_library_audiobook(),
+            self._last_audiobook,
+            self._expected_audiobook_path(),
+        ]
+        seen: set[str] = set()
+        for raw in candidates:
+            if raw is None:
+                continue
+            path = Path(raw)
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if path.is_file():
+                return path
+            merged = self._resolve_external_audiobook_path(path)
+            if merged is not None and merged.is_file():
+                return path if path.name.endswith(".chapters.json") else path
+        expected = self._expected_audiobook_path()
+        if expected is not None:
+            sidecar = expected.with_name(f"{expected.stem}.chapters.json")
+            if sidecar.is_file():
+                return sidecar
+        md = self._current_markdown_path()
+        if md is not None:
+            aliases = self._markdown_audiobook_aliases(md)
+            for lib_label, lib_path in self._audiobook_lib_entries:
+                if lib_label in aliases or lib_label.lower() in aliases:
+                    return lib_path
+        return None
+
+    def _sync_library_pick_for_path(self, audio_path: Path) -> None:
+        if not hasattr(self, "audiobook_lib_combo"):
+            return
+        resolved = audio_path.resolve()
+        for lib_label, lib_path in self._audiobook_lib_entries:
+            if lib_path.resolve() == resolved:
+                self.audiobook_lib_pick_var.set(lib_label)
+                self._sync_audiobook_action_buttons()
+                return
+        md = self._current_markdown_path()
+        if md is not None:
+            self._select_library_audiobook_for_markdown(md)
 
     def _apply_speed_from_combo(self) -> None:
         try:
@@ -2515,6 +3460,7 @@ class NovelflowApp(tk.Tk):
             c.file is not None and is_pygame_playable(c.file) for c in chapters
         )
         self._last_audiobook = audio_path
+        self._sync_library_pick_for_path(audio_path)
         self.audio_open_btn.configure(state=tk.NORMAL)
         self.audio_play_btn.configure(state=tk.NORMAL)
         self._player.set_volume(self.volume_var.get() / 100.0)
@@ -2824,12 +3770,11 @@ class NovelflowApp(tk.Tk):
         )
         idx = self._player.index
         total = len(self._player_chapters)
-        if 0 <= idx < total:
+        if self._player_playable and 0 <= idx < total:
             self.player_chapter_title_var.set(self._player_chapters[idx].title)
-            self.player_chapter_sub_var.set(f"File {idx + 1} of {total}")
-        elif not self._player_chapters:
-            self.player_chapter_title_var.set("")
-            self.player_chapter_sub_var.set("")
+            self.player_chapter_sub_var.set(f"Chapter {idx + 1} of {total}")
+        else:
+            self._set_player_chapter_placeholders()
         if hasattr(self, "_book_tl"):
             self._draw_book_timeline()
 
@@ -2866,7 +3811,7 @@ class NovelflowApp(tk.Tk):
         if isinstance(event.widget, (tk.Entry, tk.Text)):
             return
         try:
-            if self.notebook.index(self.notebook.select()) == 2 and self._player_playable:
+            if self._tab_index == 2 and self._player_playable:
                 self._player_toggle()
                 return "break"
         except tk.TclError:
